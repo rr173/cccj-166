@@ -12,6 +12,15 @@
     python3 -m revoke_ledger.cli result     DB REVOCATION_ID
     python3 -m revoke_ledger.cli show       DB [GENERATION]
     python3 -m revoke_ledger.cli history    DB
+
+Offline CDC transaction ingestor:
+    python3 -m revoke_ledger.cli cdc-source  DB CONFIG.json
+    python3 -m revoke_ledger.cli cdc-receive DB SOURCE_ID FRAGMENTS.jsonl
+    python3 -m revoke_ledger.cli cdc-status  DB SOURCE_ID [WINDOW]
+    python3 -m revoke_ledger.cli cdc-advance DB SOURCE_ID [LIMIT]
+    python3 -m revoke_ledger.cli cdc-skip    DB SOURCE_ID SEQ REASON DIGEST
+    python3 -m revoke_ledger.cli cdc-explain DB SOURCE_ID SEQ
+    python3 -m revoke_ledger.cli cdc-row     DB MANAGED_TABLE ROW_ID
 """
 
 import json
@@ -94,6 +103,38 @@ def main(argv):
         elif cmd == "history":
             L = Ledger(args[0])
             _dump(L.history())
+        elif cmd == "cdc-source":
+            db, cfg_path = args
+            L = Ledger(db)
+            _dump(L.cdc().install_source(_load(cfg_path)))
+        elif cmd == "cdc-receive":
+            db, source_id, frag_path = args
+            L = Ledger(db)
+            summary = L.cdc().receive_file(frag_path)
+            assert summary["source_id"] == source_id
+            _dump(summary)
+        elif cmd == "cdc-status":
+            db, source_id = args[0], args[1]
+            window = int(args[2]) if len(args) > 2 else None
+            L = Ledger(db)
+            _dump(L.cdc().source_status(source_id, window=window))
+        elif cmd == "cdc-advance":
+            db, source_id = args[0], args[1]
+            limit = int(args[2]) if len(args) > 2 else None
+            L = Ledger(db)
+            _dump(L.cdc().advance(source_id, limit=limit))
+        elif cmd == "cdc-skip":
+            db, source_id, seq, reason, digest = args
+            L = Ledger(db)
+            _dump(L.cdc().skip_rejected(source_id, int(seq), reason, digest))
+        elif cmd == "cdc-explain":
+            db, source_id, seq = args
+            L = Ledger(db)
+            _dump(L.cdc().explain_transaction(source_id, int(seq)))
+        elif cmd == "cdc-row":
+            db, table, row_id = args
+            L = Ledger(db)
+            _dump(L.cdc().explain_row(table, int(row_id)))
         else:
             print(__doc__)
             return 2

@@ -15,12 +15,17 @@ Public surface (see README.md for the full protocol and semantics):
     Ledger.explain_batch(id) / explain_revocation(id)
     Ledger.recover_interrupted_plan(...)        -> resume from persisted stage
     Ledger.head() / snapshots() / history() / ledger()
+    Ledger.cdc()                               -> offline CDC transaction ingestor
 """
 
 from .constraints import (CONSTRAINT_SCHEMA, ConstraintSet, validate_config)
 from .ledger import Ledger, REASON_TEXT
 from .protocol import SCHEMA, validate_program, program_digest
 from .rprotocol import RELATIONAL_SCHEMA, validate_relational_program
+from .cdcp import (CDC_CONFIG_SCHEMA, CDC_FRAGMENT_SCHEMA, CDC_PROGRAM_SCHEMA,
+                   validate_fragment, validate_source_config,
+                   validate_cdc_program)
+from .cdc import CdcBusyError, CdcIngestor
 from .errors import (BatchAbort, IntegrityError, LedgerError, LimitError,
                      ProtocolError, StaleError)
 
@@ -28,6 +33,9 @@ __all__ = [
     "Ledger", "REASON_TEXT", "SCHEMA", "validate_program", "program_digest",
     "CONSTRAINT_SCHEMA", "ConstraintSet", "validate_config",
     "RELATIONAL_SCHEMA", "validate_relational_program",
+    "CDC_CONFIG_SCHEMA", "CDC_FRAGMENT_SCHEMA", "CDC_PROGRAM_SCHEMA",
+    "validate_fragment", "validate_source_config", "validate_cdc_program",
+    "CdcIngestor", "CdcBusyError",
     "BatchAbort", "IntegrityError", "LedgerError", "LimitError", "ProtocolError",
     "StaleError",
 ]

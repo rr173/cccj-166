@@ -145,7 +145,8 @@ def _translate_abort(abort):
         return "Blocked", "blocked_guard"
     if code == "constraint_violation":
         return "Blocked", "blocked_constraint_violation"
-    if code in ("pk_conflict", "delete_missing", "write_source_missing"):
+    if code in ("pk_conflict", "delete_missing", "write_source_missing",
+                "cdc_before_mismatch"):
         return "Blocked", "blocked_pk_conflict"
     return "Blocked", "blocked_step_failure"
 
@@ -206,6 +207,27 @@ class Ledger:
 
     def close(self):
         self.db.close()
+
+    def cdc(self):
+        """The offline CDC transaction ingestor bound to this ledger."""
+        from .cdc import CdcIngestor
+        if not hasattr(self, "_cdc"):
+            self._cdc = CdcIngestor(self)
+        return self._cdc
+
+    def _guard_cdc_ownership(self, program):
+        """Ordinary programs may not write tables exclusively owned by a CDC
+        source.  Reads remain allowed (association/aggregation programs read the
+        managed rows the ingestor produced)."""
+        owned = {r["managed_table"] for r in self.db.conn.execute(
+            "SELECT managed_table FROM cdc_source_table")}
+        if not owned:
+            return
+        for step in program.get("steps", []):
+            if step.get("op") == "write" and step.get("table") in owned:
+                raise LedgerError(
+                    f"table {step['table']!r} is exclusively owned by a CDC "
+                    f"source; ordinary batch programs cannot write it")
 
     # ------------------------------------------------------------ state
     def head(self):
@@ -382,6 +404,12 @@ class Ledger:
     def ingest(self, program, idempotency_key=None):
         """Validate and durably register a program.  Does not execute it."""
         prog = validate_program(program)
+        # The CDC tables are created lazily; only consult them when present.
+        has_cdc = self.db.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+            "name='cdc_source_table'").fetchone()
+        if has_cdc is not None:
+            self._guard_cdc_ownership(prog)
         lid = prog["logical_batch_id"]
         phash = program_digest(prog)
         raw = self.db.ingest_row(lid)
@@ -1652,7 +1680,7 @@ class Ledger:
             derived = {"relations": b["evidence"]["relations"],
                        "writes": b["evidence"].get("writes", []),
                        "guards": b["evidence"].get("guards", [])}
-        return {
+        out = {
             "batch_ord": b["batch_ord"],
             "logical_batch_id": b["logical_batch_id"],
             "status": b["status"],
@@ -1674,6 +1702,32 @@ class Ledger:
             "constraint_checks": (cons or None),
             "derived": derived,
         }
+        cdc_info = self._cdc_link(b["batch_ord"])
+        if cdc_info is not None:
+            out["cdc"] = cdc_info
+        return out
+
+    def _cdc_link(self, batch_ord):
+        has_cdc = self.db.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+            "name='cdc_batch_link'").fetchone()
+        if has_cdc is None:
+            return None
+        r = self.db.conn.execute(
+            "SELECT * FROM cdc_batch_link WHERE batch_ord=?",
+            (batch_ord,)).fetchone()
+        if r is None:
+            return None
+        change_maps = [
+            {"change_index": m["change_index"], "op": m["op"],
+             "source_table": m["source_table"],
+             "managed_table": m["managed_table"],
+             "source_key": json.loads(m["key_json"]), "row_id": m["row_id"]}
+            for m in self.db.conn.execute(
+                "SELECT * FROM cdc_change_map WHERE source_id=? AND tx_seq=? "
+                "ORDER BY change_index", (r["source_id"], r["tx_seq"]))]
+        return {"source_id": r["source_id"], "tx_seq": r["tx_seq"],
+                "tx_id": r["tx_id"], "change_maps": change_maps}
 
     def explain_derived(self, logical_batch_id):
         """Read back a relational batch's derived-source explanation.

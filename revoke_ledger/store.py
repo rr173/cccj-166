@@ -224,6 +224,184 @@ BEFORE DELETE ON constraint_config
 BEGIN SELECT RAISE(ABORT, 'constraint rules are installed once and immutable'); END;
 """
 
+# Offline CDC transaction ingestor tables.  Created lazily on first use, so a
+# database produced by an older build opens and runs unchanged (schema upgrade
+# only ever adds tables; no historical table is altered).  The CDC tables are
+# deliberately outside ManagedDB.fingerprint(): they are the ingestor's own
+# receive-history apparatus, while every official managed effect still flows
+# through the existing generation / ledger_batch machinery (which is covered).
+CDC_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS cdc_source (
+    source_id        TEXT PRIMARY KEY,
+    start_seq        INTEGER NOT NULL,
+    config_json      TEXT NOT NULL,
+    config_hash      TEXT NOT NULL,
+    installed_at     TEXT NOT NULL,
+    installed_at_generation INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cdc_source_table (
+    source_id     TEXT NOT NULL,
+    source_table  TEXT NOT NULL,
+    managed_table TEXT NOT NULL,
+    key_fields    TEXT NOT NULL,
+    ord           INTEGER NOT NULL,
+    PRIMARY KEY (source_id, source_table),
+    UNIQUE (source_id, managed_table)
+);
+
+CREATE TABLE IF NOT EXISTS cdc_source_ref (
+    source_id    TEXT NOT NULL,
+    source_table TEXT NOT NULL,
+    column_name  TEXT NOT NULL,
+    ref_table    TEXT NOT NULL,
+    ord          INTEGER NOT NULL,
+    PRIMARY KEY (source_id, source_table, column_name)
+);
+
+CREATE TABLE IF NOT EXISTS cdc_fragment (
+    source_id     TEXT NOT NULL,
+    tx_seq        INTEGER NOT NULL,
+    tx_id         TEXT NOT NULL,
+    part          TEXT NOT NULL CHECK (part IN ('begin','change','end')),
+    change_index  INTEGER,
+    semantic_hash TEXT NOT NULL,
+    fragment_json TEXT NOT NULL,
+    received_at   TEXT NOT NULL,
+    PRIMARY KEY (source_id, tx_seq, part, change_index)
+);
+
+-- The one-to-one binding of tx_seq and tx_id is kept in its own table: one
+-- transaction owns many fragment rows, so the uniqueness cannot live on the
+-- fragment table itself.
+CREATE TABLE IF NOT EXISTS cdc_tx_binding (
+    source_id TEXT NOT NULL,
+    tx_seq    INTEGER NOT NULL,
+    tx_id     TEXT NOT NULL,
+    PRIMARY KEY (source_id, tx_seq),
+    UNIQUE (source_id, tx_id)
+);
+
+CREATE TABLE IF NOT EXISTS cdc_delivery (
+    delivery_id   TEXT PRIMARY KEY,
+    source_id     TEXT NOT NULL,
+    fragment_count INTEGER NOT NULL,
+    digest        TEXT NOT NULL,
+    result_json   TEXT NOT NULL,
+    delivered_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cdc_cursor (
+    source_id    TEXT PRIMARY KEY,
+    next_seq     INTEGER NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cdc_identity (
+    source_id     TEXT NOT NULL,
+    source_table  TEXT NOT NULL,
+    key_json      TEXT NOT NULL,
+    managed_table TEXT NOT NULL,
+    row_id        INTEGER NOT NULL,
+    created_tx_seq INTEGER NOT NULL,
+    PRIMARY KEY (source_id, source_table, key_json)
+);
+
+CREATE TABLE IF NOT EXISTS cdc_allocator (
+    source_id     TEXT NOT NULL,
+    managed_table TEXT NOT NULL,
+    high_water    INTEGER NOT NULL,
+    PRIMARY KEY (source_id, managed_table)
+);
+
+CREATE TABLE IF NOT EXISTS cdc_tx_decision (
+    source_id      TEXT NOT NULL,
+    tx_seq         INTEGER NOT NULL,
+    tx_id          TEXT NOT NULL,
+    outcome        TEXT NOT NULL CHECK (outcome IN
+                     ('committed','aborted','rejected')),
+    decision_digest TEXT NOT NULL,
+    summary_json   TEXT NOT NULL,
+    detail_json    TEXT NOT NULL,
+    decided_at     TEXT NOT NULL,
+    PRIMARY KEY (source_id, tx_seq)
+);
+
+CREATE TABLE IF NOT EXISTS cdc_skip (
+    source_id     TEXT NOT NULL,
+    tx_seq        INTEGER NOT NULL,
+    reason        TEXT NOT NULL,
+    decision_digest TEXT NOT NULL,
+    skipped_at    TEXT NOT NULL,
+    PRIMARY KEY (source_id, tx_seq)
+);
+
+CREATE TABLE IF NOT EXISTS cdc_batch_link (
+    source_id      TEXT NOT NULL,
+    tx_seq         INTEGER NOT NULL,
+    tx_id          TEXT NOT NULL,
+    batch_ord      INTEGER NOT NULL,
+    logical_batch_id TEXT NOT NULL,
+    PRIMARY KEY (source_id, tx_seq),
+    UNIQUE (batch_ord)
+);
+
+CREATE TABLE IF NOT EXISTS cdc_change_map (
+    source_id     TEXT NOT NULL,
+    tx_seq        INTEGER NOT NULL,
+    change_index  INTEGER NOT NULL,
+    source_table  TEXT NOT NULL,
+    managed_table TEXT NOT NULL,
+    op            TEXT NOT NULL,
+    key_json      TEXT NOT NULL,
+    row_id        INTEGER NOT NULL,
+    PRIMARY KEY (source_id, tx_seq, change_index)
+);
+
+CREATE TRIGGER IF NOT EXISTS cdc_fragment_no_update
+BEFORE UPDATE ON cdc_fragment
+BEGIN SELECT RAISE(ABORT, 'cdc_fragment is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_fragment_no_delete
+BEFORE DELETE ON cdc_fragment
+BEGIN SELECT RAISE(ABORT, 'cdc_fragment is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_binding_no_update
+BEFORE UPDATE ON cdc_tx_binding
+BEGIN SELECT RAISE(ABORT, 'cdc tx_seq/tx_id bindings are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_binding_no_delete
+BEFORE DELETE ON cdc_tx_binding
+BEGIN SELECT RAISE(ABORT, 'cdc tx_seq/tx_id bindings are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_source_no_update
+BEFORE UPDATE ON cdc_source
+BEGIN SELECT RAISE(ABORT, 'cdc_source configuration is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_source_no_delete
+BEFORE DELETE ON cdc_source
+BEGIN SELECT RAISE(ABORT, 'cdc_source configuration is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_decision_no_update
+BEFORE UPDATE ON cdc_tx_decision
+BEGIN SELECT RAISE(ABORT, 'cdc_tx_decision is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_decision_no_delete
+BEFORE DELETE ON cdc_tx_decision
+BEGIN SELECT RAISE(ABORT, 'cdc_tx_decision is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_identity_no_update
+BEFORE UPDATE ON cdc_identity
+BEGIN SELECT RAISE(ABORT, 'cdc_identity mappings are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_identity_no_delete
+BEFORE DELETE ON cdc_identity
+BEGIN SELECT RAISE(ABORT, 'cdc_identity mappings are retained even after deletes'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_link_no_update
+BEFORE UPDATE ON cdc_batch_link
+BEGIN SELECT RAISE(ABORT, 'cdc_batch_link is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_link_no_delete
+BEFORE DELETE ON cdc_batch_link
+BEGIN SELECT RAISE(ABORT, 'cdc_batch_link is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_change_map_no_update
+BEFORE UPDATE ON cdc_change_map
+BEGIN SELECT RAISE(ABORT, 'cdc_change_map is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS cdc_change_map_no_delete
+BEFORE DELETE ON cdc_change_map
+BEGIN SELECT RAISE(ABORT, 'cdc_change_map is append-only'); END;
+"""
+
 
 def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).strftime(
@@ -319,6 +497,15 @@ class ManagedDB:
                     parent=None, kind="genesis", cause="genesis",
                     state=PhysicalState(), batch_ord=None, revocation_id=None,
                     trace={"events": [{"event": "genesis"}]})
+        else:
+            # Forward-only upgrade for databases created by older builds: the
+            # CDC apparatus is added on first use; no historical table, row or
+            # trigger is modified or dropped.
+            self.ensure_cdc_schema()
+
+    def ensure_cdc_schema(self):
+        """Idempotently create the CDC tables on an existing database."""
+        self.conn.executescript(CDC_SCHEMA_SQL)
 
     # ------------------------------------------------------------------ tx
     def tx(self):
@@ -479,16 +666,29 @@ class ManagedDB:
 
     def append_ingest(self, logical_id, program, program_hash):
         with self.tx():
-            r = self.conn.execute("SELECT MAX(batch_ord) AS m FROM ingest_record").fetchone()
-            batch_ord = (r["m"] or 0) + 1
-            seq = int(self.conn.execute(
-                "SELECT value FROM meta WHERE key='ingest_seq'").fetchone()["value"]) + 1
-            self.conn.execute("UPDATE meta SET value=? WHERE key='ingest_seq'",
-                              (str(seq),))
-            self.conn.execute(
-                "INSERT INTO ingest_record(logical_batch_id,ingest_seq,batch_ord,"
-                "program_json,program_hash,ingested_at) VALUES(?,?,?,?,?,?)",
-                (logical_id, seq, batch_ord, canon(program), program_hash, utc_now()))
+            batch_ord = self._insert_ingest_locked(logical_id, program,
+                                                   program_hash)
+        return batch_ord
+
+    def _insert_ingest_locked(self, logical_id, program, program_hash):
+        """Insert an ingest record inside a caller-held transaction.
+
+        The CDC advance must never leave a half-pending program: its ingest
+        row, ledger decision, generation and source cursor commit together, so
+        the CDC ingestor calls this inside its own single transaction.
+        """
+        r = self.conn.execute(
+            "SELECT MAX(batch_ord) AS m FROM ingest_record").fetchone()
+        batch_ord = (r["m"] or 0) + 1
+        seq = int(self.conn.execute(
+            "SELECT value FROM meta WHERE key='ingest_seq'").fetchone()["value"]) + 1
+        self.conn.execute("UPDATE meta SET value=? WHERE key='ingest_seq'",
+                          (str(seq),))
+        self.conn.execute(
+            "INSERT INTO ingest_record(logical_batch_id,ingest_seq,batch_ord,"
+            "program_json,program_hash,ingested_at) VALUES(?,?,?,?,?,?)",
+            (logical_id, seq, batch_ord, canon(program), program_hash,
+             utc_now()))
         return batch_ord
 
     def append_ledger(self, raw, evidence, outcome, abort, program_hash,

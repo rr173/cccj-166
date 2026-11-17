@@ -678,3 +678,160 @@ python3 -m revoke_ledger.cli run /tmp/rel.db SETTLE-FK       # 末端约束拒�
   project/group 形成封闭模式，未定义引用即在入批校验拒绝。
 * 关系批证据（配对、成员）随批记录持久化，体量与派生关系规模成正比；原型按小样本
   设计，未做证据外存。
+
+---
+
+## 12. 离线 CDC 事务接入器（`managed-cdc-*`，无网络/消息队列依赖）
+
+接入器把“不可靠、乱序、重复的 JSONL 片段流”变成**完整源事务**，并且只有连续前缀上的
+完整事务才能推进成普通账本批次。它不连接真实数据库、消息队列或网络：片段来自用户
+分多次交付的本地文件/对象。所有新增表在首次使用时**惰性创建**，旧库直接打开仍可运行，
+升级只加表、不改历史表；未安装 CDC 的账本行为完全不变。
+
+```
+revoke_ledger/cdcp.py        三个有版本协议的纯校验（source/fragment/程序）
+revoke_ledger/cdcexec.py     managed-cdc/v1 确定性执行器（同一份证据合同）
+revoke_ledger/cdc.py         CdcIngestor：配置/接收/状态/推进/skip/来源解释
+drills/cdc_worker.py         子进程崩溃与竞争演练的真实进程入口
+drills/run_cdc_drills.py     可执行演练（含 os._exit 真实退出、双进程竞争）
+fixtures/cdc_scenarios.py    片段夹具 + 独立字典模型 MiniModel（不 import 产品执行器）
+tests/test_cdc.py            68 项 CDC unittest
+```
+
+### 12.1 不可变来源配置 `managed-cdc-source/v1`
+
+```json
+{
+  "schema": "managed-cdc-source/v1",
+  "source_id": "crm",
+  "start_seq": 0,
+  "tables": [
+    {"source_table": "customer", "managed_table": "dim_customer",
+     "key_fields": ["tenant", "code"], "references": []},
+    {"source_table": "order", "managed_table": "fact_order",
+     "key_fields": ["oid"],
+     "references": [{"column": "cust", "references": "customer"}]}
+  ]
+}
+```
+
+* `start_seq` 是起点（非负 int64）；`tx_seq` 从该点起连续递增。每个来源表给出
+  **有序复合主键字段**与“引用列 → 被引用来源表”。引用目标必须是同一配置内声明的表。
+* 一个来源**独占**它配置的受管表：注册时这些表必须为空、没有历史批次写足迹，也不能
+  被另一个来源占用；普通程序此后对这些表的写入被拒绝（读仍允许，关联汇总照常）。
+* 配置先整体校验再安装（`CdcIngestor.install_source`），非法配置不落半份；安装后
+  解释规则不可更换，同语义重装幂等、异语义拒绝。不需要导入已有来源快照。
+
+### 12.2 有版本片段协议 `managed-cdc-fragment/v1`
+
+每个片段都含 `source_id/tx_seq/tx_id`，`part` 为 `begin|change|end`：
+
+* `begin` 声明事务身份；`change` 带从 **1** 开始的 `index`、表、操作（insert/update/
+  delete）与**完整 before/after 行**；`end` 带 `change_count` 与 `commit|abort`。
+* 接收顺序不做保证，`end` 可以先到。只有 begin、end 和恰好 `1..change_count` 的全部
+  change 齐备，事务才 `ready`；空事务（change_count=0）合法。
+* `tx_seq` 与 `tx_id` 严格一一绑定（各自唯一，不可重用），绑定保存在独立的
+  `cdc_tx_binding` 表。序号连续性在推进时按连续前缀裁决：后来事务先齐也不能跨过缺少、
+  未齐或待处理的较早序号。
+* 值域为 int64/text/bool/null；主键分量非 null。引用列只能是 null 或**主键数组**，
+  数组宽度必须等于被引用表的复合键宽度。`update` 不得改主键——主键变更必须表达为
+  delete 再 insert，否则在接收校验即拒绝。
+
+### 12.3 接收只暂存：全有或全无，绝不等于入仓
+
+`receive_file(path)` / `receive_fragments(items)`：
+
+* 先把整份交付的每个片段解析、校验（含配置依赖检查），任何一行坏 JSON（含文件末尾
+  截断）、空行、语义冲突都会让**整个文件不写**，不会先收下前几行再报失败。
+* 同一片段身份（begin/end 或某个 change index）收到同语义 JSON（对象字段顺序变化
+  不算新内容；数组次序与标量类型必须保留）→ 回原 `duplicate` 结果、无新效果；同身份
+  不同内容、tx 绑定矛盾、与已暂存 end 的 change_count 冲突等明确拒绝。
+* 已消费事务的原片段仍可核验重送（仍 duplicate），冲突重送即使在消费/撤销之后也拒绝；
+  重开后同样不能把冲突覆盖成新版本。接收只写暂存表，**不动目标数据、源消费游标或原
+  账本批次**。
+
+`source_status(source_id)` 逐序号区分等待原因，状态词包括：
+`missing_transaction / missing_begin / missing_end / missing_changes`（带具体缺哪些
+index）`/ ready / consumed_committed / consumed_aborted / rejected_pending / skipped`，
+并给出 `first_blocker` 与当前 `next_seq`。返回结果明确标注“staged only”。
+
+### 12.4 持久、无碰撞、类型敏感的身份分配
+
+* 来源主键元组按**带类型的规范化 JSON 数组**持久化（`cdc_identity.key_json`），因此
+  整数 `1`、布尔 `true`、文本 `"1"` 是三个不同身份；不拼字符串、不丢类型/分隔边界，
+  也不截断哈希或按本次文件遍历序号分配。
+* 每张受管表维护独立的高水位分配器（`cdc_allocator`），新身份取该表下一个 int64；
+  分配顺序由事务所需键集合的规范化次序决定，所以**相同初态与同一事务，片段抵达次序
+  不同得到完全相同的映射**。容量到顶（可经测试 seam 调小）整事务拒绝且不留新映射。
+* 映射在删除后保留，重建同键沿用原 row_id；映射不会指向目标表原有的其它行。推进一个
+  事务时**先登记本事务所需全部身份（含被引用键）再处理行**，因此允许子行先于父行、
+  相互引用、联合唯一值交换；引用数组只做身份翻译，父行是否存在最终交给现有约束裁决，
+  绝不会因为已分配映射就把不存在的父行当存在。失败事务的新映射与分配器推进随保存点
+  全部回滚。
+
+### 12.5 按 change index 顺序处理与批末统一约束
+
+`managed-cdc/v1` 执行器（`cdcexec.py`）把一个就绪事务物化成封闭程序后，严格按 index
+顺序应用，每个 change 读到本事务更早 change 的候选结果：
+
+* insert 要求 before=null 且目标不存在（否则 `pk_conflict`）；update 要求 before/after
+  都在、主键不变；delete 要求 before 在、after=null。
+* before 必须与当时目标**完整行**逐值相符，比较区分类型、区分缺字段与显式 null
+  （`true`≠`1`，缺列≠显式 null）；不符以 `cdc_before_mismatch` 拒绝，并在证据里给出
+  来源事务、change index、目标行、期望与实际 before，绝不静默覆盖被普通加工/撤销改过
+  的目标。
+* 级联、唯一键、外键仍走**现有批末检查**：所有显式 change 完成后统一执行一次，
+  change 之间不级联。业务/约束拒绝时整批回滚。
+
+### 12.6 推进、拒绝决定与显式 skip
+
+`advance(source_id, limit=None)` 只处理连续前缀，并用 `BEGIN IMMEDIATE` 串行化跨进程
+并发：
+
+* 每个 **commit** 源事务对应**恰好一个**账本批次（逻辑 id `cdc:<source>:<seq>:<tx>`），
+  带原始来源证据；数据世代、批次决定、身份映射、逐 change 键映射（`cdc_change_map`）
+  与源消费游标在**同一个 SQLite 事务**提交，不存在“先 ingest 留半个待执行批、再补
+  游标”。abort 事务完整齐备后被消费、记录决定但不产生任何受管写入与批次。
+* 业务/约束拒绝 commit 时保存可查询的拒绝决定（`cdc_tx_decision`，含稳定
+  `decision_digest` 与 abort 详情），目标与新映射全部回滚，游标停在此前，后续事务
+  不执行；同内容重复推进只回同一拒绝，不自动重试。进程崩溃不是业务拒绝：未提交动作
+  重开后可重做。
+* 普通批次存在未完成入批时，接入器报告阻塞，不越过它也不制造悬空批；head 已为撤销
+  世代时推进关闭（证据仍可读）。
+* `skip_rejected(source_id, seq, reason, decision_digest)` 是显式人工操作：必须给原因，
+  且 digest 必须与该来源当前**挡路**的被拒事务记录摘要逐字一致；错误摘要或非挡路序号
+  被拒。skip 落在独立的只追加 `cdc_skip` 表（拒绝记录本身保持只追加），之后才允许后续
+  序号继续；被拒片段不允许修改“修好”重送。
+
+### 12.7 选择性撤销、来源解释与崩溃语义
+
+* CDC 批次是普通批次，自动纳入原账本的选择性撤销：撤销保存的是**冻结身份与 before
+  条件**的确定性程序，撤销时不重读暂存队列、不重新分配 row_id。撤销较早来源事务后，
+  后来事务的 before 可能不再成立而 `Blocked / blocked_pk_conflict`，不会无条件写回它的
+  after；关联汇总程序（含 `managed-relational/v1`）按撤销后输入重算。
+* 来源游标与片段去重属于接收历史：撤销不是请求上游重发；即使目标批已撤销，重复交付与
+  推进也不会再次入仓。
+* 可从来源事务查到批次、每个 change 的键映射与拒绝原因
+  （`explain_transaction`），也可从受管行反查来源坐标（`explain_row`）、从账本批次反查
+  来源（`Ledger.explain_batch` 的 `cdc` 区 / `explain_batch_cdc`），重开后同样可查。
+* 崩溃点用真实子进程 `os._exit` 演练：接收落盘后（片段在、游标不动）、目标提交前
+  （无半事务、无映射、无账本批）、提交后响应返回前（重开恰有一个批次/决定，重试不
+  重复、不跳号）。两个进程竞争推进同一来源，经锁串行化后每个事务只产生一个决定。
+
+### 12.8 命令行与演练
+
+```bash
+python3 -m revoke_ledger.cli cdc-source  DB CONFIG.json
+python3 -m revoke_ledger.cli cdc-receive DB SOURCE FRAGMENTS.jsonl
+python3 -m revoke_ledger.cli cdc-status  DB SOURCE [WINDOW]
+python3 -m revoke_ledger.cli cdc-advance DB SOURCE [LIMIT]
+python3 -m revoke_ledger.cli cdc-skip    DB SOURCE SEQ REASON DIGEST
+python3 -m revoke_ledger.cli cdc-explain DB SOURCE SEQ
+python3 -m revoke_ledger.cli cdc-row     DB MANAGED_TABLE ROW_ID
+python3 drills/run_cdc_drills.py           # 主演练 + 独立字典模型核对 + 崩溃/竞争
+```
+
+主演练先交付较后事务并确认补齐前目标不变；同一事务先插子行再插父行，随后另一事务连续
+两次更新并删除/重建，最终行、引用映射、游标与账本批次数逐项与 `MiniModel` 手算结果
+核对；再覆盖重送、末尾损坏文件、同身份冲突、true 与 1 不符、约束拒绝后正确/错误摘要
+skip、撤销阻断与汇总重算。规模数据在测试运行时生成，不提交大数据或数据库文件。

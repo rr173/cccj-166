@@ -248,6 +248,9 @@ def validate_program(program, batch_index=0):
     if program.get("schema") == "managed-relational/v1":
         from .rprotocol import validate_relational_program
         return validate_relational_program(program)
+    if program.get("schema") == "managed-cdc/v1":
+        from .cdcp import validate_cdc_program
+        return validate_cdc_program(program)
     extra = set(program) - _PROG_KEYS
     _check(not extra, f"program top-level keys must be logical_batch_id/schema/steps/"
                       f"partition (extra {sorted(extra)})")

@@ -154,6 +154,9 @@ def execute_program(prog, state, constraints=None):
     if prog.get("schema") == "managed-relational/v1":
         from .relational import execute_relational_program
         return execute_relational_program(prog, state, constraints=constraints)
+    if prog.get("schema") == "managed-cdc/v1":
+        from .cdcexec import execute_cdc_program
+        return execute_cdc_program(prog, state, constraints=constraints)
     pre_state = state.copy() if constraints is not None else None
     reads_ev = []
     writes_ev = []
