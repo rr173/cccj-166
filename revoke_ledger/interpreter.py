@@ -109,14 +109,21 @@ def row_digest(row):
     return sha256(row) if row is not None else None
 
 
-def execute_program(prog, state):
+def execute_program(prog, state, constraints=None):
     """Execute one validated program on `state`.
 
     Mutates `state` as it goes.  On failure the caller must discard the state.
     Returns evidence:
       ok, reads, writes, guards, read_footprint, write_footprint,
-      read_contents, action_taken, abort.
+      read_contents, action_taken, abort, constraints.
+
+    When `constraints` is a ConstraintSet, explicit steps run unimpeded and see
+    their own transient writes.  Only after every explicit step and guard has
+    succeeded is the completed candidate state constrained: cascade deletes are
+    applied, then surviving references and unique keys are checked.  A failure
+    raises BatchAbort('constraint_violation') with the full report in detail.
     """
+    pre_state = state.copy() if constraints is not None else None
     reads_ev = []
     writes_ev = []
     guards_ev = []
@@ -290,6 +297,22 @@ def execute_program(prog, state):
         aborted = BatchAbort("internal_error", f"step {idx}: unknown op {op!r}",
                              step_index=idx)
 
+    report = None
+    if aborted is None and constraints is not None:
+        report = constraints.finalize(pre_state, state, writes_ev)
+        if not report["ok"]:
+            first = report["reasons"][0]
+            where = f"{first['table']}[{first.get('row_id')}]"
+            target = (" no rows are written"
+                      if not report["deleted"] else
+                      f" its {len(report['deleted'])} planned deletes are discarded")
+            aborted = BatchAbort(
+                "constraint_violation",
+                f"{where} violates rule {first['rule']!r} ({first['code']});"
+                f"{target}", step_index=len(prog["steps"]), table=first["table"],
+                row_id=first.get("row_id"),
+                detail={"constraints": report, "reasons": report["reasons"]})
+
     return {
         "ok": aborted is None,
         "reads": reads_ev,
@@ -301,5 +324,6 @@ def execute_program(prog, state):
                               for k in sorted(read_contents[t])}
                           for t in sorted(read_contents)},
         "action_taken": action_taken,
+        "constraints": report,
         "abort": aborted.as_dict() if aborted is not None else None,
     }

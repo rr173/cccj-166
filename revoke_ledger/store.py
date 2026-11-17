@@ -161,6 +161,16 @@ CREATE TABLE IF NOT EXISTS lineage (
     PRIMARY KEY (rev_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS constraint_config (
+    singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema       TEXT NOT NULL,
+    rules_json   TEXT NOT NULL,
+    config_hash  TEXT NOT NULL,
+    installed_at TEXT NOT NULL,
+    installed_at_generation INTEGER NOT NULL,
+    installed_before_ingest INTEGER NOT NULL
+);
+
 CREATE TRIGGER IF NOT EXISTS ledger_batch_no_update
 BEFORE UPDATE ON ledger_batch
 BEGIN SELECT RAISE(ABORT, 'ledger_batch is append-only'); END;
@@ -205,6 +215,13 @@ BEGIN SELECT RAISE(ABORT, 'revocation_diff of an applied plan is immutable'); EN
 CREATE TRIGGER IF NOT EXISTS lineage_no_delete
 BEFORE DELETE ON lineage
 BEGIN SELECT RAISE(ABORT, 'lineage is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS constraint_config_no_update
+BEFORE UPDATE ON constraint_config
+BEGIN SELECT RAISE(ABORT, 'constraint rules are installed once and immutable'); END;
+CREATE TRIGGER IF NOT EXISTS constraint_config_no_delete
+BEFORE DELETE ON constraint_config
+BEGIN SELECT RAISE(ABORT, 'constraint rules are installed once and immutable'); END;
 """
 
 
@@ -488,6 +505,58 @@ class ManagedDB:
              canon(abort) if abort is not None else None,
              canon(key_ranges) if key_ranges is not None else None, utc_now()))
 
+    # -------------------------------------------------- constraint rules
+    def constraint_config(self):
+        r = self.conn.execute(
+            "SELECT * FROM constraint_config WHERE singleton=1").fetchone()
+        if r is None:
+            return None
+        return {
+            "schema": r["schema"],
+            "rules": json.loads(r["rules_json"]),
+            "config_hash": r["config_hash"],
+            "installed_at": r["installed_at"],
+            "installed_at_generation": r["installed_at_generation"],
+            "installed_before_ingest": bool(r["installed_before_ingest"]),
+        }
+
+    def install_constraint_config(self, config_json, config_hash, generation):
+        """Persist the rule set once.  Refuses any second installation."""
+        with self.tx():
+            if self.constraint_config() is not None:
+                raise LedgerError("constraint rules are already installed and "
+                                  "cannot be replaced")
+            ingested = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM ingest_record").fetchone()["n"]
+            if ingested:
+                raise LedgerError("constraint rules must be installed before the "
+                                  "first ingest")
+            info = self.generation_info(generation)
+            if info["kind"] != "genesis" or info["row_counts"]:
+                raise LedgerError("constraint rules must be installed before the "
+                                  "seed")
+            self.conn.execute(
+                "INSERT INTO constraint_config(singleton,schema,rules_json,"
+                "config_hash,installed_at,installed_at_generation,"
+                "installed_before_ingest) VALUES(1,?,?,?,?,?,1)",
+                (json.loads(config_json)["schema"],
+                 canon(json.loads(config_json)["rules"]), config_hash,
+                 utc_now(), generation))
+        return self.constraint_config()
+
+    def config_snapshot(self):
+        """Promise over the installed rule set (empty when unconfigured)."""
+        raw = self.conn.execute(
+            "SELECT config_hash FROM constraint_config WHERE singleton=1").fetchone()
+        if raw is None:
+            return {"installed": False, "config_hash": None, "schema": None,
+                    "rule_count": 0, "rules": []}
+        cfg = self.constraint_config()
+        return {"installed": True, "config_hash": cfg["config_hash"],
+                "schema": cfg["schema"], "rule_count": len(cfg["rules"]),
+                "rules": cfg["rules"]}
+
+
     # -------------------------------------------------------- revocations
     def revocation(self, revocation_id):
         r = self.conn.execute("SELECT * FROM revocation WHERE revocation_id=?",
@@ -605,6 +674,7 @@ class ManagedDB:
             for r in self.conn.execute("SELECT * FROM generation ORDER BY generation")]
         parts["meta"] = [[r["key"], r["value"]] for r in self.conn.execute(
             "SELECT * FROM meta ORDER BY key")]
+        parts["constraint_config"] = self.config_snapshot()
         return sha256(parts)
 
     def audit_fingerprint(self):

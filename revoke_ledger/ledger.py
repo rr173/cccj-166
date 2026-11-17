@@ -29,6 +29,7 @@ Business rules
 import json
 
 from .canon import canon, content_id, sha256
+from .constraints import CONSTRAINT_SCHEMA, ConstraintSet, validate_config
 from .errors import BatchAbort, IntegrityError, LedgerError, StaleError
 from .interpreter import (eval_id_expr, eval_pred, eval_value, execute_program,
                           normalize_field_value)
@@ -50,6 +51,10 @@ REASON_TEXT = {
     "blocked_pk_conflict": "replayed on re-derived inputs; a write precondition "
                            "(primary key/source row) failed, no writes",
     "blocked_step_failure": "replayed on re-derived inputs; a step failed, no writes",
+    "blocked_constraint_violation": "replayed on re-derived inputs; the batch's "
+                                    "candidate state violates declared foreign-key "
+                                    "or unique-key rules; no writes and no cascades "
+                                    "survive",
     "blocked_historical_failure": "originally failed; historical decision preserved, not "
                                   "activated by revocation",
 }
@@ -138,9 +143,59 @@ def _translate_abort(abort):
     code = abort["code"]
     if code == "guard_failed":
         return "Blocked", "blocked_guard"
+    if code == "constraint_violation":
+        return "Blocked", "blocked_constraint_violation"
     if code in ("pk_conflict", "delete_missing", "write_source_missing"):
         return "Blocked", "blocked_pk_conflict"
     return "Blocked", "blocked_step_failure"
+
+
+def _batch_components(evidence, cs, b_ord, logical_batch_id):
+    """Compact per-generation component record for one batch (or replay).
+
+    Always persisted, even in legacy (unconfigured) mode, so that a generation
+    rebuilds a complete picture from its own trace plus the rule snapshot.
+    """
+    report = evidence.get("constraints")
+    explicit = set()
+    for w in evidence.get("writes", []):
+        for row in w["rows"]:
+            explicit.add((w["table"], row["target_row_id"]))
+    implicit = []
+    rules_triggered = set()
+    reasons = []
+    if report is not None:
+        implicit = [tuple(k) for k in report["implicit_deletes"]]
+        for d in report["deleted"]:
+            if d["implicit"] and d["rule"]:
+                rules_triggered.add(d["rule"])
+        reasons = report["reasons"]
+        for r in reasons:
+            rules_triggered.add(r["rule"])
+    return {
+        "constraint_config": _config_snapshot(cs),
+        "row_writes": {
+            "explicit": sorted([t, r] for (t, r) in explicit),
+            "implicit": sorted([t, r] for (t, r) in implicit),
+        },
+        "constraint_checks": {
+            "ok": report is None or report["ok"],
+            "reasons": reasons,
+            "deleted_count": len(implicit),
+            "roots": (report or {}).get("roots", []),
+        },
+        "rules_triggered": sorted(rules_triggered),
+        "batch": {"batch_ord": b_ord, "logical_batch_id": logical_batch_id},
+    }
+
+
+def _config_snapshot(cs):
+    if cs is None:
+        return {"installed": False, "config_hash": None, "schema": None,
+                "rule_count": 0, "rules": []}
+    return {"installed": True, "config_hash": cs.config_hash,
+            "schema": CONSTRAINT_SCHEMA, "rule_count": len(cs.config["rules"]),
+            "rules": cs.view()["rules"]}
 
 
 # ---------------------------------------------------------------------------
@@ -180,12 +235,92 @@ class Ledger:
     def ledger(self):
         return self.db.batches()
 
+    # ------------------------------------------------------- constraints
+    def install_constraints(self, config):
+        """Install the declarative relation rules for a *new* ledger.
+
+        Must happen before the seed or, at the latest, before the first ingest.
+        A configuration that already exists can never be replaced.  The whole
+        configuration is validated first, so an invalid one installs nothing.
+        """
+        normalized = validate_config(config)
+        existing = self.db.constraint_config()
+        if existing is not None:
+            if existing["config_hash"] == sha256(normalized):
+                return self.constraints_view()
+            raise LedgerError(
+                "constraint rules are already installed; a ledger's rule set is "
+                "immutable and cannot be replaced")
+        head = self.head()
+        info = self.db.generation_info(head["generation"])
+        if self.db.ingest_batches():
+            raise LedgerError("constraint rules must be installed before the first "
+                              "ingest")
+        if info["kind"] != "genesis" or info["row_counts"]:
+            raise LedgerError("constraint rules must be installed before the seed")
+        self.db.install_constraint_config(canon(normalized),
+                                          sha256(normalized), head["generation"])
+        return self.constraints_view()
+
+    def constraints(self):
+        """The installed rule set as a ConstraintSet, or None (legacy mode)."""
+        raw = self.db.constraint_config()
+        if raw is None:
+            return None
+        return ConstraintSet({"schema": raw["schema"], "rules": raw["rules"]})
+
+    def constraints_view(self):
+        """Persistent read-back of the installed configuration."""
+        raw = self.db.constraint_config()
+        cs = self.constraints()
+        if raw is None:
+            return {"installed": False, "schema": None, "config_hash": None,
+                    "rules": [], "participating_tables": [],
+                    "installed_at": None, "installed_at_generation": None,
+                    "installed_before_ingest": False,
+                    "semantics": self._constraint_semantics()}
+        return {
+            "installed": True,
+            "schema": raw["schema"],
+            "config_hash": raw["config_hash"],
+            "rules": raw["rules"],
+            "participating_tables": sorted(cs.participating_tables()),
+            "installed_at": raw["installed_at"],
+            "installed_at_generation": raw["installed_at_generation"],
+            "installed_before_ingest": raw["installed_before_ingest"],
+            "semantics": self._constraint_semantics(),
+        }
+
+    @staticmethod
+    def _constraint_semantics():
+        return {
+            "check_point": "after all explicit steps and guards of a batch",
+            "foreign_key_values": "int64 or null; bool is not an integer; a "
+                                  "missing field means null",
+            "null_foreign_key": "does not require a parent row",
+            "unique_keys": "any tuple containing null is ignored; the rest "
+                           "compare by type and value (1, true and '1' differ)",
+            "delete_roots": "row identities present before the batch that are "
+                            "absent after its explicit steps; a row_id deleted "
+                            "and recreated in the same batch is not a root",
+            "cascade": "applied only after all explicit steps; reachability "
+                       "closure over CASCADE edges; each row deleted at most "
+                       "once; cycles terminate",
+            "restrict": "checked only after the cascade closure, against "
+                        "surviving candidate rows",
+            "failure": "the whole batch is rejected; explicit writes and "
+                       "cascades are discarded",
+        }
+
     def seed(self, rows):
         """Create the initial managed state as one committed generation.
 
         `rows` = {table: {row_id: {column: value}}}.  Empty tables are retained
         so that a later "empty read" batch can be defined against them.  Only
         valid before any batch is ingested; seeding twice is rejected.
+
+        When constraints are installed, the proposed seed state must already
+        satisfy them; otherwise nothing is committed.
         """
         if self.db.ingest_batches():
             raise LedgerError("cannot seed after batches have been ingested")
@@ -210,12 +345,37 @@ class Ledger:
                     from .interpreter import normalize_field_value
                     normalize_field_value(val, -1, col)
                 st.put_row(table, int(rid), row)
+        cs = self.constraints()
+        report = None
+        if cs is not None:
+            reasons = cs.validate_state(st)
+            if reasons:
+                report = {"ok": False, "reasons": reasons, "deleted": [],
+                          "roots": [], "explicit_deletes": [],
+                          "implicit_deletes": []}
+                raise BatchAbort(
+                    "constraint_violation",
+                    f"seed state violates {len(reasons)} declared rule check(s); "
+                    f"first: rule {reasons[0]['rule']!r} ({reasons[0]['code']})",
+                    table=reasons[0]["table"], row_id=reasons[0].get("row_id"),
+                    detail={"constraints": report, "reasons": reasons})
         with self.db.tx():
             self.db._create_generation_locked(
                 parent=head["generation"], kind="seed", cause="seed", state=st,
                 batch_ord=None, revocation_id=None,
                 trace={"events": [{"event": "seed",
-                                   "tables": sorted(rows)}]})
+                                   "tables": sorted(rows),
+                                   "components": {
+                                       "constraint_config": self.db.config_snapshot(),
+                                       "row_writes": {
+                                           "explicit": sorted(
+                                               [t, r] for (t, r) in
+                                               st.snapshot_rows()),
+                                           "implicit": []},
+                                       "constraint_checks": report or {
+                                           "ok": True, "reasons": [],
+                                           "note": "no constraint rules installed"},
+                                   }}]})
         return self.head()
 
     # ----------------------------------------------------------- ingest
@@ -295,20 +455,24 @@ class Ledger:
                 "closed in that lineage (evidence remains readable)")
         prog = raw["program"]
         working = self.db.state(head["generation"])
+        cs = self.constraints()
         try:
-            evidence = execute_program(prog, working)
+            evidence = execute_program(prog, working, constraints=cs)
         except BatchAbort as exc:
             evidence = {"ok": False, "abort": exc.as_dict(), "reads": [],
                         "writes": [], "guards": [], "read_contents": {},
                         "read_footprint": {}, "write_footprint": {},
-                        "action_taken": False}
+                        "action_taken": False, "constraints": None}
         phash = raw["program_hash"]
         parent = head["generation"]
         key_ranges = self._key_ranges(prog)
         if evidence["ok"]:
             trace = {"events": [{"event": "batch_commit",
                                  "batch_ord": raw["batch_ord"],
-                                 "logical_batch_id": logical_batch_id}]}
+                                 "logical_batch_id": logical_batch_id,
+                                 "components": _batch_components(
+                                     evidence, cs, b_ord=raw["batch_ord"],
+                                     logical_batch_id=logical_batch_id)}]}
             with self.db.tx():
                 gen = self.db._create_generation_locked(
                     parent=parent, kind="batch", cause="batch", state=working,
@@ -318,8 +482,11 @@ class Ledger:
                                       key_ranges=key_ranges)
         else:
             outcome = {"ok": False, "abort": evidence["abort"]}
+            abort = dict(evidence["abort"])
+            if evidence["abort"]["code"] == "constraint_violation":
+                abort.update(evidence["abort"].get("detail", {}))
             with self.db.tx():
-                self.db.append_ledger(raw, evidence, outcome, evidence["abort"],
+                self.db.append_ledger(raw, evidence, outcome, abort,
                                       phash, parent, "failed", None,
                                       key_ranges=key_ranges)
         return self.db.batch_by_logical_id(logical_batch_id)
@@ -526,6 +693,19 @@ class Ledger:
                         why.append("write targets leave partition")
                         break
             if ok:
+                # Recorded cascade deletes are effects too: a skip that reuses
+                # them must account for the child tables they reach.
+                for d in (b["evidence"].get("constraints") or {}).get("deleted", []):
+                    if d["table"] != part["table"] or not self._in_ranges(
+                            d["row_id"], part["ranges"]):
+                        ok = False
+                        why.append(
+                            f"recorded cascade delete {d['table']}[{d['row_id']}] "
+                            f"(rule {d['rule']!r}) leaves the declared partition; "
+                            f"the reuse proof would reach rows outside its only "
+                            f"structural declaration")
+                        break
+            if ok:
                 for t, ids in influence["write_keys"].items():
                     if t == part["table"] and any(
                             self._in_ranges(i, part["ranges"]) for i in ids):
@@ -555,27 +735,45 @@ class Ledger:
         # demoted to a real replay and the derivation is rebuilt.  Skip is
         # therefore never justified by "our write sets happen not to overlap".
         old_head_state = self.db.state(self.db.head()["generation"])
+        cs = self.constraints()
+        config_snapshot = _config_snapshot(cs)
+        cascade_dependencies = self._cascade_dependencies(cs) if cs is not None else []
         while True:
             derived = self._derive(target, prior_success, later_success,
-                                   base_state, skip_set, failed_success=later_failed)
+                                   base_state, skip_set, failed_success=later_failed,
+                                   constraints=cs,
+                                   old_head_state=old_head_state)
             demoted = set(derived["failed_skip_proofs"])
             actual_changed = self._changed_keys(old_head_state, derived["state"])
+            for bo in demoted:
+                if bo in eligibility:
+                    eligibility[bo]["why"].append(
+                        "constraint/read/write outcome re-check failed on the "
+                        "derived state; demoted to a real replay")
             for b in later_success:
                 bo = b["batch_ord"]
                 if bo not in skip_set or bo in demoted:
                     continue
-                touched = set()
-                for rs in program_reads(b["program"]):
-                    touched.update((rs["table"], e["row_id"]) for e in rs["map"])
-                for w in b["evidence"]["writes"]:
-                    touched.update((w["table"], row["target_row_id"])
-                                   for row in w["rows"])
-                overlap = touched & actual_changed
+                detail = eligibility[bo]
+                detail["dependencies"] = self._scope_dependencies(b, cs)
+                if cs is not None:
+                    # Object-level proof: no actually changed key may belong to
+                    # the batch's own scope, its constraint dependency closure
+                    # (references both ways, unique groups, cascade reach), nor
+                    # to the cascade reach of an actually deleted row.
+                    own = self._scope_keys(derived["state"], [b])
+                    dep = self._dependency_closure(derived["state"], own, b, cs,
+                                                    pre_state=old_head_state)
+                else:
+                    own = self._scope_keys(derived["state"], [b])
+                    dep = set(own)
+                detail["dependency_closure_keys"] = sorted([list(k) for k in dep])
+                overlap = dep & actual_changed
                 if overlap:
                     demoted.add(bo)
-                    eligibility[bo]["why"].append(
-                        f"scope intersects actually changed keys "
-                        f"{sorted(map(list, overlap))}")
+                    detail["why"].append(
+                        f"scope or its constraint dependency closure intersects "
+                        f"actually changed keys {sorted(map(list, overlap))}")
             if not demoted:
                 break
             skip_set -= demoted
@@ -593,24 +791,24 @@ class Ledger:
             if m["reuse_kind"] != "skipped_independent":
                 continue
             part = part_tables[bo]
-            own_read_keys = set()
-            for rs in program_reads(b["program"]):
-                own_read_keys.update((rs["table"], e["row_id"]) for e in rs["map"])
-            own_write_keys = set()
-            for w in b["evidence"]["writes"]:
-                own_write_keys.update((w["table"], row["target_row_id"])
-                                      for row in w["rows"])
-            touched = own_read_keys | own_write_keys
-            overlap = sorted([list(k) for k in touched & actual_changed])
+            own = self._scope_keys(final_state, [b])
+            dep = self._dependency_closure(final_state, own, b, cs,
+                                            pre_state=old_head_state)
+            overlap = sorted([list(k) for k in own & actual_changed])
             m["detail"]["actual_changed_keys_in_scope"] = overlap
+            m["detail"]["constraint_dependency_keys"] = sorted(
+                [list(k) for k in dep if k not in own])
+            m["detail"]["actual_dependency_overlap"] = sorted(
+                [list(k) for k in dep & actual_changed])
             m["detail"]["declared_partition"] = part
             m["detail"]["proof"] = proof_details[bo]
             m["detail"]["why_unaffected"] = (
                 "declared partition covers all read-map and write identities and is "
                 "disjoint from the revoked batch's write keys and complete read scope; "
-                "the re-checked read classifications and write before-images/output "
-                "bytes are unchanged, and no actually changed key lies in the batch's "
-                "scope")
+                "the re-checked read classifications, write before-images/output "
+                "bytes and constraint outcomes are unchanged; no actually changed "
+                "key lies in the batch's scope or in its constraint dependency "
+                f"closure (references, unique groups, cascade reach: {len(dep)} keys)")
             m["detail"]["actual_disjointness_proven"] = not overlap
             if overlap:
                 raise IntegrityError(
@@ -687,6 +885,9 @@ class Ledger:
             "base_promise": base_promise,
             "current_generation": current_generation,
             "current_promise": current_promise,
+            "constraint_config": config_snapshot,
+            "cascade_dependencies": cascade_dependencies,
+            "target_implicit_deletes": self._implicit_deletes_of(target),
             "influence": influence,
             "skip_set": sorted(skip_set),
             "skip_eligibility": {str(k): v for k, v in sorted(eligibility.items())},
@@ -703,14 +904,17 @@ class Ledger:
                 "planned_generation": current_generation + 1}
 
     def _derive(self, target, prior_success, later_success, base_state, skip_set,
-                failed_success=None):
+                failed_success=None, constraints=None, old_head_state=None):
         """Replay later successes on the pre-target state with the given skip set.
 
         Every non-skipped successful batch is executed with its original program
         in original order.  A blocked batch performs no writes and leaves the
         state untouched.  A skipped batch is NOT executed: its original output
-        rows are copied from its old generation after proving its read results
-        and write preconditions match the current state.
+        rows are copied from its old generation after proving its read results,
+        write preconditions and constraint outcomes match the current state.
+
+        Revocation is *not* a reverse cascade log: the new state is derived by
+        replaying this semantic definition from the pre-target generation.
         """
         state = base_state.copy()
         decisions = {}
@@ -719,12 +923,13 @@ class Ledger:
         for b in later_success:
             bo = b["batch_ord"]
             if bo in skip_set:
-                ok, proof = self._skip_proof(state, b)
+                ok, proof = self._skip_proof(state, b, constraints=constraints)
                 proofs[bo] = proof
                 if not ok:
                     failed_skips.append(bo)
                     continue
                 self._retain_outputs(state, b)
+                self._retain_cascades(state, b)
                 decisions[bo] = {
                     "batch_ord": bo,
                     "logical_batch_id": b["logical_batch_id"],
@@ -734,19 +939,23 @@ class Ledger:
                     "detail": {"note": REASON_TEXT["independent_partition"],
                                "original_generation": b["generation"],
                                "basis": "declared_partition + full_read_scope + "
-                                        "write_preconditions + actual_disjointness",
+                                        "write_preconditions + constraint "
+                                        "dependencies + actual_disjointness",
                                "executed": False},
                 }
                 continue
             before = state.copy()
             try:
-                ev = execute_program(b["program"], state)
+                if constraints is None:
+                    ev = execute_program(b["program"], state)
+                else:
+                    ev = execute_program(b["program"], state, constraints=constraints)
             except BatchAbort as exc:
                 # A value-expression type error is a step failure: no writes survive.
                 ev = {"ok": False, "abort": exc.as_dict(), "reads": [],
                       "writes": [], "guards": [], "read_contents": {},
                       "read_footprint": {}, "write_footprint": {},
-                      "action_taken": False}
+                      "action_taken": False, "constraints": None}
             if ev["ok"]:
                 if (ev["read_contents"] == b["evidence"]["read_contents"]
                         and self._output_rows_of(ev, state) == self._outputs(b)):
@@ -756,7 +965,7 @@ class Ledger:
             else:
                 disp, reason = _translate_abort(ev["abort"])
                 kind = "not_written"
-                state = before  # blocked: no writes survive
+                state = before  # blocked: no writes and no cascades survive
             decisions[bo] = {
                 "batch_ord": bo,
                 "logical_batch_id": b["logical_batch_id"],
@@ -767,6 +976,13 @@ class Ledger:
                     "note": REASON_TEXT[reason],
                     "executed": True,
                     "abort": ev["abort"],
+                    "components": _batch_components(
+                        ev, constraints, b_ord=bo,
+                        logical_batch_id=b["logical_batch_id"]),
+                    "constraint_reasons": (
+                        ev["abort"].get("detail", {}).get("reasons", [])
+                        if not ev["ok"] and ev["abort"]["code"] ==
+                        "constraint_violation" else []),
                     "reads_match_original": ev["read_contents"] == b["evidence"]["read_contents"],
                     "outputs_match_original": ev["ok"] and
                         self._output_rows_of(ev, state) == self._outputs(b),
@@ -783,6 +999,7 @@ class Ledger:
                          "table": w["table"],
                          "targets": [row["target_row_id"] for row in w["rows"]]}
                         for w in ev["writes"]],
+                    "replay_deletes": self._cascade_summary(ev),
                 },
             }
         # Originally failed batches: historical only, never activated.
@@ -801,13 +1018,15 @@ class Ledger:
         return {"state": state, "decisions": decisions, "proofs": proofs,
                 "failed_skip_proofs": failed_skips}
 
-    def _skip_proof(self, state, batch):
-        """Prove a skipped batch's reads and write preconditions still hold.
+    def _skip_proof(self, state, batch, constraints=None, pre_state=None,
+                    old_head_state=None):
+        """Prove a skipped batch's reads, writes and constraints still hold.
 
         The proof simulates the batch's *own* writes on a scratch copy so that a
         later read step of the same batch sees the same earlier-step writes it
         saw originally.  Nothing is executed against the real state here; the
-        caller retains the committed output rows only after this passes.
+        caller retains the committed output rows and recorded cascade deletes
+        only after this passes.
 
         Checks, in step order:
           * every read step: the complete map classification (absent/excluded/
@@ -816,7 +1035,11 @@ class Ledger:
           * every guard: still passes with the same value;
           * every write step: source rows retained, target before-images equal,
             and the computed output bytes equal the original after-images;
-            then applies those bytes to the scratch copy.
+            then applies those bytes to the scratch copy;
+          * with constraints installed: the completed scratch state's cascade
+            deletion set and violation reasons equal the original batch's
+            recorded ones, so foreign-key existence, unique occupancy and
+            cascade reach on *other* tables are part of the proof.
         """
         reads = [s for s in batch["program"]["steps"] if s["op"] == "read"]
         writes = [s for s in batch["program"]["steps"] if s["op"] == "write"]
@@ -828,6 +1051,8 @@ class Ledger:
         detail = {"read_checks": [], "guard_checks": [], "write_checks": [],
                   "executed": False}
         scratch = state.copy()
+        scratch_pre = state.copy()
+        applied_writes = []
         reads_env = dict(_reads_env_from_evidence(batch))
         read_i = write_i = guard_i = 0
         for step in batch["program"]["steps"]:
@@ -869,8 +1094,12 @@ class Ledger:
                 # Apply the computed output to the scratch copy for later reads.
                 from .interpreter import eval_id_expr, eval_value, normalize_field_value
                 entry = reads_env.get(step["rows_alias"], {})
+                step_ev = {"step_index": step.get("step_index"),
+                           "effect": step["effect"], "table": step["table"],
+                           "rows": []}
                 for ent in step["rows"]:
                     tgt = eval_id_expr(ent["row_id"])
+                    step_ev["rows"].append({"target_row_id": tgt})
                     if step["effect"] == "delete":
                         scratch.delete_row(step["table"], tgt)
                     else:
@@ -882,6 +1111,21 @@ class Ledger:
                                                   "row_id": src,
                                                   "reads": reads_env}, 0), 0, col)
                         scratch.put_row(step["table"], tgt, row)
+                applied_writes.append(step_ev)
+        if constraints is not None:
+            report = constraints.finalize(scratch_pre, scratch, applied_writes)
+            orig = batch["evidence"].get("constraints") or {}
+            got_dels = sorted([d["table"], d["row_id"]] for d in report["deleted"])
+            want_dels = sorted([d["table"], d["row_id"]]
+                               for d in orig.get("deleted", []))
+            detail["constraint_check"] = {
+                "deleted": got_dels, "original_deleted": want_dels,
+                "reasons": report["reasons"],
+                "original_reasons": orig.get("reasons", []),
+            }
+            if got_dels != want_dels or report["reasons"] != orig.get("reasons", []):
+                detail["failed"] = "constraint_outcome_changed"
+                return False, detail
         detail["passed"] = True
         return True, detail
 
@@ -896,6 +1140,114 @@ class Ledger:
                     old = self.db.get_row_at(gen, w["table"], tgt)
                     if old is not None:
                         state.put_row(w["table"], tgt, old)
+
+    def _retain_cascades(self, state, batch):
+        """Re-apply the batch's recorded *implicit* cascade deletes.
+
+        Skipping is not "copy the explicit writes": a parent replacement in a
+        later batch can legitimately have cascaded rows away that were never
+        named by a delete step.  Those identities were fixed in the original
+        generation and are reused byte-for-byte after the proof passes.
+        """
+        for d in (batch["evidence"].get("constraints") or {}).get("deleted", []):
+            if d.get("implicit"):
+                state.delete_row(d["table"], d["row_id"])
+
+    @staticmethod
+    def _cascade_summary(evidence):
+        report = evidence.get("constraints") or {}
+        return {
+            "roots": report.get("roots", []),
+            "explicit_deletes": report.get("explicit_deletes", []),
+            "implicit_deletes": report.get("implicit_deletes", []),
+            "rules": sorted({d["rule"] for d in report.get("deleted", [])
+                             if d.get("rule")}),
+        }
+
+    @staticmethod
+    def _implicit_deletes_of(batch):
+        report = batch["evidence"].get("constraints") or {}
+        return [{"table": d["table"], "row_id": d["row_id"], "rule": d["rule"],
+                 "trigger_chain": d["trigger_chain"], "root": d["root"]}
+                for d in report.get("deleted", []) if d.get("implicit")]
+
+    # ---------------------------------------------- constraint scope help
+    @staticmethod
+    def _scope_keys(state, batches):
+        """Explicit read-map and write identities of the given batches."""
+        keys = set()
+        for b in batches:
+            for rs in program_reads(b["program"]):
+                keys.update((rs["table"], e["row_id"]) for e in rs["map"])
+            for w in b["evidence"]["writes"]:
+                keys.update((w["table"], row["target_row_id"])
+                            for row in w["rows"])
+            for d in (b["evidence"].get("constraints") or {}).get("deleted", []):
+                keys.add((d["table"], d["row_id"]))
+                if d.get("root"):
+                    keys.add((d["root"][0], d["root"][1]))
+        return keys
+
+    def _dependency_closure(self, state, own_keys, batch, cs, pre_state=None):
+        """Own scope plus constraint dependencies and cascade reach.
+
+        A changed key outside this closure cannot change the batch's declared
+        constraint outcome: foreign-key existence is only about the referenced
+        parent identity, unique occupancy only about the key group, and cascade
+        only about the reachable child identities.  The closure is expanded
+        transitively, so multi-level references and cycles are covered.
+
+        Rows that are already absent from the derived state (e.g. swept by the
+        revoked target's cascade) are still part of a batch's scope when its
+        explicit map names them; the skip proof re-checks the recorded cascade
+        deletion set, so a smaller cascade can never pass silently.
+        """
+        if cs is None:
+            return set(own_keys)
+        scope = cs.dependency_scope(state, own_keys)
+
+        def add_cascade_reach(keys):
+            new = set(keys)
+            frontier = list(keys)
+            while frontier:
+                pt, pr = frontier.pop()
+                for rule in cs._fk:
+                    if rule["parent"] != pt or rule["on_delete"] != "CASCADE":
+                        continue
+                    child, field = rule["child"], rule["field"]
+                    for crid in state.row_ids(child):
+                        row = state.get_row(child, crid)
+                        v = (row or {}).get(field)
+                        if type(v) is int and v == pr and (child, crid) not in new:
+                            new.add((child, crid))
+                            frontier.append((child, crid))
+            return new
+
+        return add_cascade_reach(scope)
+
+    def _scope_dependencies(self, batch, cs):
+        if cs is None:
+            return {"mode": "unconfigured", "note": "no declared rules"}
+        deps = {}
+        for key in sorted(self._scope_keys(None, [batch])):
+            table, rid = key
+            for rule in cs.config["rules"]:
+                if rule["kind"] == "foreign_key" and (
+                        rule["child"] == table or rule["parent"] == table):
+                    deps.setdefault(rule["name"], []).append([table, rid])
+                if rule["kind"] == "unique" and rule["table"] == table:
+                    deps.setdefault(rule["name"], []).append([table, rid])
+        return {"mode": "declared_rules",
+                "note": "scope expanded across references both ways, unique "
+                        "key groups and CASCADE reach",
+                "rules_touching_scope": {k: sorted(v) for k, v in sorted(deps.items())}}
+
+    def _cascade_dependencies(self, cs):
+        """All CASCADE edges of the installed rule set (audit snapshot)."""
+        return [{"rule": r["name"], "child": r["child"], "field": r["field"],
+                 "parent": r["parent"], "on_delete": r["on_delete"]}
+                for r in cs.config["rules"]
+                if r["kind"] == "foreign_key" and r["on_delete"] == "CASCADE"]
 
     def _outputs(self, batch):
         gen = batch["generation"]
@@ -970,8 +1322,15 @@ class Ledger:
         failed_later = [b for b in all_batches
                         if b["batch_ord"] > target["batch_ord"]
                         and b["status"] == "failed"]
+        cs = self.constraints()
+        if (plan["payload"].get("constraint_config") or {}).get("config_hash") != \
+                _config_snapshot(cs)["config_hash"]:
+            raise StaleError("constraint_config_changed",
+                             "installed constraint rules changed after planning")
         derived = self._derive(target, prior_success, later_success, base_state,
-                               skip_set, failed_success=failed_later)
+                               skip_set, failed_success=failed_later,
+                               constraints=cs,
+                               old_head_state=self.db.state(plan["current_generation"]))
         if derived["failed_skip_proofs"]:
             raise StaleError("skip_proof_failed",
                              "a batch planned as skipped can no longer be proven "
@@ -990,11 +1349,32 @@ class Ledger:
                 or state_promise(final_state) != plan["payload"]["expected_state_promise"]:
             raise StaleError("state_diverged",
                              "re-derived state does not match the planned state")
+        if cs is not None:
+            # Last gate: the committed end state of a revocation must itself
+            # satisfy the declared rules (no plan may smuggle a bad state in).
+            reasons = cs.validate_state(final_state)
+            if reasons:
+                raise StaleError(
+                    "constraint_violation",
+                    "re-derived revocation state violates declared rules; refusing "
+                    "to commit a state with unresolved constraint reasons",
+                    {"reasons": reasons})
         planned_gen = plan["current_generation"] + 1
         if planned_gen != plan["planned_generation"]:
             raise StaleError("generation_mismatch", "generation numbering diverged")
         skipped_actual = sorted(bo for bo, m in derived["decisions"].items()
                                 if m["reuse_kind"] == "skipped_independent")
+        blocked_reasons = {str(bo): m["reason_code"]
+                           for bo, m in derived["decisions"].items()
+                           if m["disposition"] == "Blocked"}
+        implicit_writes = []
+        for bo in sorted(derived["decisions"]):
+            m = derived["decisions"][bo]
+            if not m["detail"].get("executed") or m["disposition"] == "Blocked":
+                continue
+            for d in (m["detail"].get("components", {})
+                      .get("row_writes", {}).get("implicit", [])):
+                implicit_writes.append(list(d))
         trace = {"events": [
             {"event": "revocation_apply", "revocation_id": rev["revocation_id"],
              "plan_id": plan_id, "target_batch_ord": target["batch_ord"],
@@ -1003,10 +1383,24 @@ class Ledger:
              "skipped_batch_ords": skipped_actual,
              "blocked_batch_ords": sorted(bo for bo, m in derived["decisions"].items()
                                           if m["disposition"] == "Blocked"),
+             "blocked_reason_codes": blocked_reasons,
              "mapping": [{"batch_ord": m["batch_ord"],
                           "disposition": m["disposition"],
                           "reason_code": m["reason_code"]}
                          for m in plan["payload"]["mapping"]],
+             "components": {
+                 "constraint_config": _config_snapshot(cs),
+                 "cascade_dependencies": (plan["payload"]
+                                          .get("cascade_dependencies", [])),
+                 "constraint_checks": {
+                     "ok": True,
+                     "reasons": [],
+                     "note": "per-batch reports in mapping details; final state "
+                             "re-validated before commit"},
+                 "row_writes": {
+                     "explicit": "per replayed batch in its mapping detail",
+                     "implicit": sorted(implicit_writes)},
+             },
              "diff_count": len(plan["payload"]["diff"])},
         ]}
         result = {
@@ -1029,6 +1423,8 @@ class Ledger:
             "blocked_batch_ords": sorted(
                 bo for bo, m in derived["decisions"].items()
                 if m["disposition"] == "Blocked"),
+            "blocked_reasons": blocked_reasons,
+            "implicit_delete_keys": sorted(implicit_writes),
             "applied_at": utc_now(),
         }
         with self.db.tx():
@@ -1135,6 +1531,9 @@ class Ledger:
             "current_promise": plan["current_promise"],
             "base_promise": plan["base_promise"],
             "influence": p.get("influence"),
+            "constraint_config": p.get("constraint_config"),
+            "cascade_dependencies": p.get("cascade_dependencies"),
+            "target_implicit_deletes": p.get("target_implicit_deletes"),
             "skip_set": p.get("skip_set"),
             "skip_eligibility": p.get("skip_eligibility"),
             "proofs": p.get("proofs"),
@@ -1220,3 +1619,67 @@ class Ledger:
 
     def managed_state_view(self, generation=None):
         return self.snapshots(generation)
+
+    # ------------------------------------------------------ explanations
+    def explain_batch(self, logical_batch_id):
+        """Read back a batch's constraint identity, effects and reasons."""
+        b = self.db.batch_by_logical_id(logical_batch_id)
+        if b is None:
+            raise LedgerError(f"unknown batch {logical_batch_id!r}")
+        cons = b["evidence"].get("constraints")
+        abort = b["abort"] or {}
+        return {
+            "batch_ord": b["batch_ord"],
+            "logical_batch_id": b["logical_batch_id"],
+            "status": b["status"],
+            "generation": b["generation"],
+            "parent_generation": b["parent_generation"],
+            "program_hash": b["program_hash"],
+            "abort_code": abort.get("code"),
+            "constraint_config": self.db.config_snapshot(),
+            "constraint_reasons": (cons or {}).get("reasons", [])
+                if cons else abort.get("reasons", []),
+            "row_effects": {
+                "explicit": sorted(
+                    [w["table"], row["target_row_id"]]
+                    for w in b["evidence"].get("writes", [])
+                    for row in w["rows"]),
+                "implicit": (cons or {}).get("implicit_deletes", []),
+                "deleted": (cons or {}).get("deleted", []),
+            },
+            "constraint_checks": (cons or None),
+        }
+
+    def explain_revocation(self, revocation_id_or_plan_id):
+        """Constraint-aware explanation of a plan/result including cascades."""
+        view = self.revocation_result(revocation_id_or_plan_id)
+        plan = self.db.plan_for_revocation(view["revocation_id"]) \
+            if self.db.revocation(view["revocation_id"]) else self.db.plan(
+                revocation_id_or_plan_id)
+        payload = plan["payload"] if plan else {}
+        detail = {}
+        for m in view.get("mapping", []):
+            d = m.get("detail") or {}
+            detail[m["logical_batch_id"]] = {
+                "disposition": m["disposition"],
+                "reason_code": m["reason_code"],
+                "reuse_kind": m.get("reuse_kind"),
+                "constraint_reasons": d.get("constraint_reasons", []),
+                "replay_deletes": d.get("replay_deletes"),
+                "dependency_closure": d.get("constraint_dependency_keys"),
+                "actual_dependency_overlap": d.get("actual_dependency_overlap"),
+                "skipped": m.get("reuse_kind") == "skipped_independent",
+            }
+        return {
+            "revocation_id": view["revocation_id"],
+            "plan_id": view.get("plan_id"),
+            "phase": view["phase"],
+            "target": view.get("target"),
+            "constraint_config": payload.get("constraint_config"),
+            "cascade_dependencies": payload.get("cascade_dependencies"),
+            "target_implicit_deletes": payload.get("target_implicit_deletes"),
+            "batches": detail,
+            "blocked": {k: v["reason_code"] for k, v in detail.items()
+                        if v["disposition"] == "Blocked"},
+            "result": view.get("result"),
+        }

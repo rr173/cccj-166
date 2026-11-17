@@ -8,19 +8,24 @@
 
 ```
 revoke_ledger/          协议校验、解释器、SQLite 物理层、账本/计划/应用/恢复
+revoke_ledger/constraints.py  声明式关系完整性：规则、批末检查、级联闭包、依赖域
 fixtures/scenarios.py   演练用初始数据与批次程序
 oracle.py               独立参考解释器：从初始状态全量重放（不做跳过优化）
+constraint_oracle.py    独立的约束参考实现（朴素重复扫描，不 import 产品包）
 reference_interpreter.py  oracle 的实现，不 import 产品包
 drills/run_drills.py    可执行演练，逐条打印并断言产品 == oracle
+drills/run_constraint_drills.py  约束功能演练（级联、唯一键、撤销阻断）
 tests/test_ledger.py    60 项 unittest
+tests/test_constraints.py 31 项约束 unittest
 ```
 
 ```bash
 cd /workspace
-python3 -m unittest discover -s tests -v     # 60 tests
+python3 -m unittest discover -s tests -v     # 91 tests
 python3 drills/run_drills.py                 # full drill, prints evidence
+python3 drills/run_constraint_drills.py      # constraint drills, prints evidence
 python3 drills/run_drills.py --keep /tmp/d   # keep the main SQLite db
-python3 -m revoke_ledger.cli --help  # thin CLI: init/ingest/run/plan/apply/result/show/history
+python3 -m revoke_ledger.cli --help  # config/ingest/run/plan/apply/explain
 ```
 
 ---
@@ -110,7 +115,7 @@ is_null(field, true/false) -> (v IS NULL) == 布尔
 
 一个批次可声明其读写只发生在 `partition.table` 的 `partition.ranges`（有序不交叠的
 int64 闭区间）内。撤销计划只有在所有读写身份**都真的落在**该表该区间内时，才会把这
-一声明用作“可跳过”的结构性依据之一（见 §5.3）。
+一声明用作“可跳过”的结构性依据之一（见 §6.3）。
 
 ---
 
@@ -139,9 +144,101 @@ head 取一个 generation 号，然后只读该 generation，因此只能看到�
 
 `epoch` 每次成功提交递增，撤销计划记录它捕获的 head 世代与 epoch，应用时逐项核对。
 
-## 5. 撤销：计划 → 应用
+## 5. 声明式关系完整性（SQLite 之外的确定性约束层）
 
-### 5.1 业务定义
+约束不是 SQLite 外键/触发器：它们是**账本自己管理的规则集**，在批末对
+“所有显式步骤都成功之后的候选状态”统一计算。这样中间读写可以完全自由，
+而每个提交的世代都满足约束。
+
+### 5.0 配置协议 `managed-constraints/v1`
+
+```json
+{
+  "schema": "managed-constraints/v1",
+  "rules": [
+    {"name": "account_owner_fk", "kind": "foreign_key",
+     "child": "account", "field": "owner_id",
+     "parent": "owner", "on_delete": "CASCADE"},
+    {"name": "owner_code_u", "kind": "unique",
+     "table": "owner", "fields": ["code"]}
+  ]
+}
+```
+
+* 每条规则有**稳定且唯一**的 `name`；外键指定子表一个字段、父表 `row_id`，
+  `on_delete` 只能是 `CASCADE` 或 `RESTRICT`。支持同表引用、多层引用、循环引用。
+* 规则集合在 seed 或首次入批前安装一次（`Ledger.install_constraints`），
+  落 `constraint_config` 单行并由触发器禁止 `UPDATE/DELETE`；之后不可更换。
+  同一配置重复安装是幂等的，不同配置一律拒绝。
+* 配置先整体校验再落盘：非法配置**不会安装半份**（`state` 仍为未配置）。
+* seed 本身必须满足规则，否则 seed 不提交、不产生世代；旧库未配置时完全沿用
+  原有语义（不做在线加规则）。
+* `Ledger.constraints_view()` 读回持久化配置、`config_hash`、安装世代与语义说明；
+  重新打开数据库结果一致。
+
+### 5.1 值语义
+
+* 外键值只能是 int64 或 null；**bool 不算整数**（记 `fk_type` 原因）。
+  null 不要求父行存在；字段缺失按 null 处理。
+* 唯一键中**只要含 null 该元组就不参与冲突**；其余元组按**类型与值**比较，
+  因此 `1`、`true`、`"1"` 三者互不相同。
+
+### 5.2 批末检查顺序（终态检查）
+
+对每个批，显式步骤按序执行，读能看到本批更早的显式写入（与原有语义完全一致，
+主键冲突/guard/表达式规则照常生效）。全部显式步骤与 guard 成功后，才做**一次**
+关系检查：
+
+1. **删除起点（按行身份）**：比较批前状态与显式步骤完成后的候选状态，凡是
+   “原来存在、现在不存在”的 `(table, row_id)` 都是删除起点。同一个 `row_id`
+   删除后又在同批重建，则不算消失。
+2. **CASCADE 闭包**：从起点出发，反复删除候选状态中仍引用已删父行的子行，
+   直到没有新增删除。每个行至多删除一次，环因此必然终止。**新插入**的、引用
+   本批被删父行的子行也进入闭包。
+3. **存活行检查**：闭包完成后才检查存活行的 RESTRICT 引用、其它外键存在性与
+   唯一键冲突。因此被另一条级联路径删掉的 RESTRICT 子行不拦截；凭空写一个
+   不存在的父 `row_id` 是 `fk_missing` 违规，绝不会被当成“合法级联”。
+4. 任一原因 → **整批失败**：所有显式写入与级联删除都不落正式数据，不产生世代；
+   原因记录到 `ledger_batch.abort_json`。
+
+### 5.3 多条原因的稳定记录
+
+原因按 `(rule, code, table, 行身份, 规范化 JSON)` 排序去重，每条含规则名、
+表、行身份、字段，以及父身份或唯一键组：
+
+```json
+{"code": "fk_missing", "rule": "account_owner_fk", "table": "account",
+ "row_id": 2, "field": "owner_id", "parent": "owner", "referenced_row_id": 5}
+{"code": "restrict_violation", "rule": "note_owner_fk", "table": "note",
+ "row_id": 900, "deleted_parent": ["owner", 1]}
+{"code": "unique_violation", "rule": "owner_code_u", "table": "owner",
+ "row_ids": [1, 3], "fields": ["code"], "values": [{"type":"text","value":"c"}]}
+```
+
+成功批的证据里区分**显式写入**与**隐式删除**，并给出可追溯的触发链：
+
+```json
+"deleted": [
+  {"table": "node", "row_id": 3, "explicit": false, "implicit": true,
+   "rule": "node_parent_fk", "root": ["owner", 1],
+   "trigger_chain": [
+     {"from_table":"owner","from_row_id":1,"to_table":"node","to_row_id":1,
+      "rule":"node_owner_fk","on_delete":"CASCADE"},
+     {"from_table":"node","from_row_id":1,"to_table":"node","to_row_id":2,
+      "rule":"node_parent_fk","on_delete":"CASCADE"},
+     {"from_table":"node","from_row_id":2,"to_table":"node","to_row_id":3,
+      "rule":"node_parent_fk","on_delete":"CASCADE"}],
+   "inserted_in_batch": false, "extra_parents": []}
+]
+```
+
+多条路径到达同一行时只删除一次；第一条到达路径记为 `trigger_chain`，其余
+已删父行记入 `extra_parents`。起点、显式/隐式集合、规则快照与检查结果同时写入
+世代 `trace.components`，可用 `Ledger.explain_batch(id)` 读回。
+
+## 6. 撤销：计划 → 应用
+
+### 6.1 业务定义
 
 撤销目标是**已成功**批次 `T`（失败批不能撤销，且撤销时也不会被激活）。
 `T` 之前已成功的批保持原样（`Kept / upstream_of_target`），它们定义了撤销的出发点。
@@ -151,16 +248,24 @@ head 取一个 generation 号，然后只读该 generation，因此只能看到�
 |---|---|---|
 | 目标 `T` | `Superseded` | 不执行，效果被“从 T 之前出发”的推导自然移除 |
 | 之后成功批 | `Kept / reused_identical` | 重放后读结果与写输出逐值等于原执行 |
-| 之后成功批 | `Kept / independent_partition` | **不执行**，原输出逐值保留（见 §5.3） |
+| 之后成功批 | `Kept / independent_partition` | **不执行**，原输出逐值保留（见 §6.3） |
 | 之后成功批 | `Changed / changed_replay` | 重放后结果不同；**新结果是该批的正式结果** |
 | 之后成功批 | `Blocked / blocked_guard` | guard 不成立，零写入，不产生世代 |
 | 之后成功批 | `Blocked / blocked_pk_conflict` | 主键/删除/写源前置条件失败，零写入 |
+| 之后成功批 | `Blocked / blocked_constraint_violation` | 重放后候选状态违反外键/唯一键/级联约束，零写入、零级联 |
 | 之后原失败批 | `Blocked / blocked_historical_failure` | 只保留历史决定，**不激活** |
+
+撤销的结果是**在新语义下从头推导**的，不是把原级联日志反向写回：从目标前的世代
+出发重放，级联在每次重放的批末重新计算；若某个后续批因引用或唯一键不再可行，
+它以 `blocked_constraint_violation` 结束，绝不留局部级联。计划载荷记录规则快照
+（`constraint_config`）、全部 CASCADE 边（`cascade_dependencies`）与目标的隐式删除
+（`target_implicit_deletes`）；应用前会核对规则集未变，并对最终世代独立复核一次
+约束，任何未解决原因都会拒绝提交。`Ledger.explain_revocation(id)` 读回这些内容。
 
 关键点：**不是沿用后来批次的旧输出**。`B=2*A` 在新输入 `A=10` 上重新执行得到 20，
 而不是保留 40；也不会删掉 `beta`。原来失败的批不会因为撤销而“变成成功”。
 
-### 5.2 计划阶段（不改正式世代）
+### 6.2 计划阶段（不改正式世代）
 
 `plan_revocation(revocation_id, target_logical_id)` 在一个事务里分三段落盘：
 
@@ -185,7 +290,7 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
 重复对同一 revocation id + 同一目标调用 plan 是幂等的：从同一已提交 base 重算，
 载荷与摘要逐字节相同，只替换尚未应用的 `planned` 记录。
 
-### 5.3 跳过（skip）的证明：不是“写集合不相交”
+### 6.3 跳过（skip）的证明：不是“写集合不相交”
 
 空选择与谓词范围意味着：撤掉一行可能让另一批**首次**满足 `row_count == 0/1`，
 也可能让原先未选中的行**进入**选择窗口。仅跟踪“原来读出的 row_id”或仅比较两批写
@@ -193,24 +298,36 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
 
 1. 该批**声明了**键分区；
 2. 该批**所有**读 map 身份与**所有**写目标都在该分区的表/区间内；
-3. 分区与目标的**写键**、目标的**完整读作用域**在同一表上不相交；
-4. 用当前推导状态**逐项复核**该批每个读步骤的完整 map 分类（absent/excluded/selected
-   以及观察到的行值）、每个 guard 的值、每个写步骤的目标前置镜像与计算输出字节，
+3. 该批**记录过的隐式级联删除**也必须落在该分区的表/区间内——否则复用证明
+   会碰触声明之外的行，直接保守重放；
+4. 分区与目标的**写键**、目标的**完整读作用域**在同一表上不相交；
+5. 用当前推导状态**逐项复核**该批每个读步骤的完整 map 分类（absent/excluded/selected
+   以及观察到的行值）、每个 guard 的值、每个写步骤的目标前置镜像与计算输出字节、
+   以及**约束结果**（级联删除集合与违规原因列表必须与原执行逐项相等），
    全部与原执行一致；
-5. 在推导结束后再取“旧 head ↔ 新推导状态”的**实际改变键集合**，要求该批所有读写
-   身份都与实际改变键不相交；若因**其他 Changed 批**间接改变了它的输入，则撤销跳过、
-   降级为真实重放，并重新推导（可能级联多次，直到稳定）。
+6. 在推导结束后再取“旧 head ↔ 新推导状态”的**实际改变键集合**，要求该批所有读写
+   身份**及其约束依赖闭包**都与实际改变键不相交。闭包由声明规则计算：
+   外键两个方向（引用的父行、引用它的子行）、唯一键组、以及沿 CASCADE 边的可达集，
+   逐层传递（覆盖多层引用和环）。若因**其他 Changed 批**或**目标的级联**间接改变了
+   闭包内的键，则撤销跳过、降级为真实重放，并重新推导（可能级联多次，直到稳定）。
+
+约束依赖是第 6 条的关键：一个“显式读/写只在自己的表里”的批仍可能因为**别的表**
+上的父行消失（外键存在性）、唯一值被占（唯一键）、或被级联扫到而改变结论。
+因此这类批必须进入解释器重放，得到 `Blocked / blocked_constraint_violation`
+及可定位的原因；真正无关的分区（依赖闭包与改变键不相交）仍然跳过。
 
 只要任一条件不满足（例如声明分区与目标的读作用域相交、缺少声明、实际改变键落入其
-作用域），该批一律**保守重放**。跳过时输出行逐值从原世代拷入推导状态，轨迹里记录
-`executed=false` 与证明对象；`actual_changed_keys_in_scope` 必须为空。
-`skip_eligibility` 会记录每个没有资格跳过的批的具体原因。
+作用域或依赖闭包），该批一律**保守重放**。跳过时输出行与记录的隐式级联删除逐值从
+原世代拷入推导状态，轨迹里记录 `executed=false` 与证明对象；
+`actual_changed_keys_in_scope`、`actual_dependency_overlap` 必须为空；
+`constraint_dependency_keys` 记录被检查过的依赖行。`skip_eligibility` 会记录每个
+没有资格跳过的批的具体原因。
 
-### 5.4 应用阶段（原子提交，拒绝陈旧计划）
+### 6.4 应用阶段（原子提交，拒绝陈旧计划）
 
 `apply_plan(plan_id)` 先做完整陈旧性核对，然后才提交：
 
-1. 计划存在且 `phase='planned'`（已应用则直接返回已记录结果，见 §5.5）；
+1. 计划存在且 `phase='planned'`（已应用则直接返回已记录结果，见 §6.5）；
 2. 计划载荷摘要自校验；
 3. **当前 head 的 generation/epoch 与计划捕获值相同**；
 4. **当前完整数据库承诺（fingerprint）与计划捕获值相同**。该承诺覆盖所有世代的
@@ -225,7 +342,7 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
 把计划标为 `applied` 并记录不可变结果 → 写 `lineage`。并发应用同一计划时，
 `UPDATE ... WHERE phase='planned'` 只有一个事务能成功，其余返回同一条已记录结果。
 
-### 5.5 响应丢失与恢复
+### 6.5 响应丢失与恢复
 
 * **应用提交后响应丢失**：`revocation_result(revocation_id)` 按撤销 ID（或 plan ID）
   返回同一份已提交决定（phase/applied 世代/mapping/diff/state_promise）。重复
@@ -240,14 +357,14 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
 * **撤销 ID 复用**：一个 revocation id 永远只绑定一个目标；已应用的撤销不能再规划、
   也不能改绑；同一个目标不能被两次撤销（`LedgerError`）。
 
-## 6. 原证据只读，新结果以新世代保存
+## 7. 原证据只读，新结果以新世代保存
 
 `ledger_batch`（程序/输入指纹/读写足迹/逐行分类证据/guard 证据/失败决定）与旧世代
 行全部只追加、触发器禁止改删。撤销只新增：`revocation`、`generation_plan`、
 `revocation_mapping`、`revocation_diff`、`lineage` 和一个 `kind='revocation'` 的新世代。
 撤销世代的 `trace` 明确记录执行的批号、**跳过的批号**、blocked 批号与映射摘要。
 
-## 7. 演练与独立对照
+## 8. 演练与独立对照
 
 `oracle.py` + `reference_interpreter.py` 是完全独立的参考实现（不 import 产品包），
 从**初始种子世代**出发、按公开定义**全量重放**（跳过目标，不做任何跳过优化）。
@@ -272,6 +389,47 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
 | 切换后响应丢失 | 按撤销 ID 取回同一决定，重复 apply 不新增世代 |
 | 中断的计划构建 | 从 `planning` 阶段重做，结果与正常计划一致 |
 
+### 8.1 约束演练（`drills/run_constraint_drills.py`）
+
+约束演练的期望删除集合与终态由 `constraint_oracle.py` 计算：它只复用无产品依赖
+的 `reference_interpreter`（显式程序步骤），关系部分用**朴素重复扫描**独立实现
+（集合差求删除起点、`while changed` 重扫求闭包、逐行枚举求违规），**不复用**
+产品的 `ConstraintSet.finalize` 或依赖域函数。演练逐条打印并断言产品 == oracle：
+
+| 场景 | 期望 |
+|---|---|
+| 子行 `entry[200]`→`account[20]`→`owner[3]` 在同一批、父行最后插入 | 成功；批末检查 `ok=True` |
+| 同一批交换 `owner[1]`/`owner[2]` 的唯一值 | 成功 |
+| 交换后终态重复 | 整批 `constraint_violation`，原因定位 `unique_violation` + `row_ids [1,3]`，零写入、head 不变 |
+| 一次删除经两条路径并穿过 `node 7↔8` 环 | 删除集合恰为 `{owner1, node1,2,3,7,8,9}`；`node[9]` 只删一次，第二条路径记入 `extra_parents`；触发链逐跳可读 |
+| RESTRICT 子行 `note[900]` 已被另一条 CASCADE（`ledger[50]`）清掉 | 允许删除（仍记录显式/隐式与被触发规则） |
+| 同一 RESTRICT 子行存活 | 整批拒绝（`restrict_violation`），旧数据逐值不变 |
+| 目标批新增 `owner[5]`，后批 `L` 在**另一张表** `account` 上写引用它的子行 | 撤销目标后 `L` 必须 `Blocked / blocked_constraint_violation`（`fk_missing`），即使显式分区与目标写表不同；真正无关的 `note` 批仍 `skipped_independent`，执行轨迹里可见 |
+| 父行删后重建（同批） | 不是删除起点，不级联 |
+| 新插子行引用本批被删父行 | 进入级联（`inserted_in_batch=true`, `implicit=true`） |
+| 引用从未存在的父行 | `fk_missing` 拒绝，**不同**于级联 |
+| 决策后重开数据库 | 规则、隐式影响、约束原因与终态一致 |
+
+运行示例（摘自约束演练输出）：
+
+```
+  disposition by batch (original order):
+    #1  T   Superseded  superseded_target              removed
+    #2  L   Blocked     blocked_constraint_violation   not_written
+    #3  Z   Kept        independent_partition          skipped_independent
+  L's constraint reasons: [{"code": "fk_missing", "rule": "account_owner_fk",
+                            "table": "account", "row_id": 2, "referenced_row_id": 5}]
+  interpreter invoked for: ['L']
+  replayed batch ords : []
+  skipped batch ords  : [3]
+  blocked batch ords  : [2] reasons={'2': 'blocked_constraint_violation'}
+  trace: executed=[2] skipped=[3] blocked=[2]
+  oracle[revocation]: MATCH on every table/row/value
+```
+
+`tests/test_constraints.py` 覆盖同一组语义的点对点断言（31 项），
+`tests/test_ledger.py` 的 60 项旧测试保证未配置账本的语义未变。
+
 运行示例（摘自主演练输出）：
 
 ```
@@ -290,19 +448,26 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
   executed_batch_ords = [3]     skipped_batch_ords = [4]
 ```
 
-## 8. 边界与不变量
+## 9. 边界与不变量
 
 * 撤销后该血缘不再接受新批执行（新结果已不是原时间顺序的自然延伸）；证据仍可读。
 * 一个目标最多被撤销一次；一个 revocation id 最多应用一次。
 * 一个批次的所有写入在失败时全部不生效（批级原子），世代只表示成功提交。
 * 所有哈希/摘要基于规范化 JSON（键排序、无空白），证据可逐字节复算。
 * 值域外类型、int64 溢出、跨类型算术、越界 row_id 都在协议/执行层被拒绝。
+* 配置安装是**一次性的**：已配置账本的规则集不可替换；未配置账本没有在线加规则入口。
+* 约束检查是纯函数，不依赖 SQLite 外键/触发器，也不做物理级联；失败批不落任何行。
+* 任何提交（seed、批、撤销世代）都必须满足已安装规则；撤销应用前会独立复核终态。
 
-## 9. 已知取舍
+## 10. 已知取舍
 
 * `int_sum` 跳过 NULL 字段；若字段存在非 int 值则该批失败（保守）。
 * 键分区是**显式声明**，不是自动推断；没有声明就永远重放，宁可保守。
 * 计划与应用的重新推导是确定性的纯重放，成本与受影响批次规模成正比；独立分区批
   完全不执行。
+* 约束闭包按行身份与规则名排序做 BFS，结果确定；多条路径只保留首条触发链并将
+  其余父行记入 `extra_parents`，便于审计而非穷举所有路径。
+* 带约束依赖的跳过证明比纯显式读写证明更保守：依赖闭包（外键双向、唯一键组、
+  CASCADE 可达集）与实际改变键相交就重放，宁可多执行也不误跳。
 * 该原型为单文件 SQLite、单进程入口设计；并发应用已用事务与条件更新做了串行化，
   但未做跨数据库分布式事务（任务明确无需）。

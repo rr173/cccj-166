@@ -67,6 +67,15 @@ including earlier writes of the same batch.  A failed guard or a primary-key
 conflict is a failpoint: the step is not applied, failure is recorded, no later
 step runs.  Successful batches commit all steps atomically.  Batch time order
 is the insertion order and is immutable.
+
+Declared relation rules
+-----------------------
+A ledger may install a ``managed-constraints/v1`` configuration once, before
+the seed or first ingest (see ``constraints.py``).  Explicit steps then run
+exactly as above, and only the completed candidate state is constrained:
+deletion roots are row identities present before the batch and absent after
+its steps, a CASCADE closure is applied, then surviving references and unique
+keys are checked.  A violation rejects the whole batch.
 """
 
 import copy
