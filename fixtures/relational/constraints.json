@@ -1,0 +1,21 @@
+{
+ "rules": [
+  {
+   "child": "audit_summary",
+   "field": "customer_ref",
+   "kind": "foreign_key",
+   "name": "audit_customer_fk",
+   "on_delete": "RESTRICT",
+   "parent": "customers"
+  },
+  {
+   "fields": [
+    "ticket"
+   ],
+   "kind": "unique",
+   "name": "enriched_ticket_u",
+   "table": "order_enriched"
+  }
+ ],
+ "schema": "managed-constraints/v1"
+}

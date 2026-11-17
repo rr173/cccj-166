@@ -9,21 +9,28 @@
 ```
 revoke_ledger/          协议校验、解释器、SQLite 物理层、账本/计划/应用/恢复
 revoke_ledger/constraints.py  声明式关系完整性：规则、批末检查、级联闭包、依赖域
+revoke_ledger/rprotocol.py    managed-relational/v1 程序校验（连接/投影/分组/派生写）
+revoke_ledger/relational.py   managed-relational/v1 确定性执行器（关系算子与证据）
 fixtures/scenarios.py   演练用初始数据与批次程序
+fixtures/relational_scenarios.py  入仓加工（订单->渠道归属->客户汇总）夹具与手算预期
+fixtures/relational/    提交的 CLI 示例 JSON（种子/约束/加工程序）
 oracle.py               独立参考解释器：从初始状态全量重放（不做跳过优化）
 constraint_oracle.py    独立的约束参考实现（朴素重复扫描，不 import 产品包）
 reference_interpreter.py  oracle 的实现，不 import 产品包
 drills/run_drills.py    可执行演练，逐条打印并断言产品 == oracle
 drills/run_constraint_drills.py  约束功能演练（级联、唯一键、撤销阻断）
+drills/run_relational_drills.py  关系加工演练（配对/分组/金额逐项断言 + CLI）
 tests/test_ledger.py    60 项 unittest
 tests/test_constraints.py 31 项约束 unittest
+tests/test_relational.py  62 项关系加工程序 unittest
 ```
 
 ```bash
 cd /workspace
-python3 -m unittest discover -s tests -v     # 91 tests
+python3 -m unittest discover -s tests -v     # 153 tests
 python3 drills/run_drills.py                 # full drill, prints evidence
 python3 drills/run_constraint_drills.py      # constraint drills, prints evidence
+python3 drills/run_relational_drills.py      # relational drills, prints evidence
 python3 drills/run_drills.py --keep /tmp/d   # keep the main SQLite db
 python3 -m revoke_ledger.cli --help  # config/ingest/run/plan/apply/explain
 ```
@@ -116,6 +123,14 @@ is_null(field, true/false) -> (v IS NULL) == 布尔
 一个批次可声明其读写只发生在 `partition.table` 的 `partition.ranges`（有序不交叠的
 int64 闭区间）内。撤销计划只有在所有读写身份**都真的落在**该表该区间内时，才会把这
 一声明用作“可跳过”的结构性依据之一（见 §6.3）。
+
+### 2.7 第二套协议
+
+除 `managed-batch/v1` 外，账本还接受关系加工程序协议 `managed-relational/v1`
+（读取显式候选域 → 不可变关系别名 → 连接/投影/分组 → 对派生关系每行写入），
+用于“按订单明细匹配渠道归属、再按客户汇总”这类关联汇总加工。完整定义见 §11。
+两套协议共用同一入批、世代、约束与撤销合同；`managed-batch/v1` 的行为与历史证据
+完全不变。
 
 ---
 
@@ -323,6 +338,10 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
 `constraint_dependency_keys` 记录被检查过的依赖行。`skip_eligibility` 会记录每个
 没有资格跳过的批的具体原因。
 
+`managed-relational/v1` 程序**永不进入跳过集合**：派生关系经连接/分组依赖整个读
+作用域，产品选择对它们一律保守重放（见 §11.7），`skip_eligibility` 会记录该原因。
+`managed-batch/v1` 分区批的跳过路径不受影响。
+
 ### 6.4 应用阶段（原子提交，拒绝陈旧计划）
 
 `apply_plan(plan_id)` 先做完整陈旧性核对，然后才提交：
@@ -458,6 +477,10 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
 * 配置安装是**一次性的**：已配置账本的规则集不可替换；未配置账本没有在线加规则入口。
 * 约束检查是纯函数，不依赖 SQLite 外键/触发器，也不做物理级联；失败批不落任何行。
 * 任何提交（seed、批、撤销世代）都必须满足已安装规则；撤销应用前会独立复核终态。
+* 关系批（§11）的行出现身份只由程序与读结果决定，与读 map 的排列无关；同一程序
+  重放必产生逐字节相同的关系摘要、配对与分组。
+* 关系批的写目标只来自声明的整数字段或封闭安全整数表达式；同步骤目标碰撞整批
+  拒绝；`sum` 只判最终 int64 溢出，中间累计精确。
 
 ## 10. 已知取舍
 
@@ -471,3 +494,187 @@ epoch 在计划前后完全相同（测试与演练都会断言）。
   CASCADE 可达集）与实际改变键相交就重放，宁可多执行也不误跳。
 * 该原型为单文件 SQLite、单进程入口设计；并发应用已用事务与条件更新做了串行化，
   但未做跨数据库分布式事务（任务明确无需）。
+
+---
+
+## 11. 关系加工程序协议 `managed-relational/v1`
+
+入仓加工需要“按订单明细匹配渠道归属、再按客户汇总金额”：同一渠道可能对应多条
+有效归属（一对多），尚未匹配的明细也要留下来。逐行显式映射表达不了这种关联汇总，
+因此账本接受第二套有版本协议，把**关联与分组作为真正的批程序能力**接入同一套
+入批/世代/约束/撤销合同。程序仍是惰性数据：不执行调用者代码、SQL 或外部请求。
+
+```json
+{
+  "logical_batch_id": "SETTLE-INNER",
+  "schema": "managed-relational/v1",
+  "steps": [ <step>, ... ],
+  "partition": {"table": "gamma", "ranges": [[100,199]]}   // 可选，同 v1
+}
+```
+
+### 11.1 步骤
+
+```json
+{"op": "read", "alias": "o",
+ "select": {"table": "orders", "where": <pred>},
+ "map": [{"row_id": 1, "table": "orders"}, ...],
+ "row_id_field": "oid"}                       // 可选：把源 row_id 暴露为字段
+
+{"op": "join", "left": "o", "right": "a", "how": "inner"|"left",
+ "on": [{"left": "channel", "right": "channel"}, ...], "alias": "j"}
+
+{"op": "project", "from": "j", "alias": "p",
+ "select": [{"from": "left.amount", "as": "amount"},
+            {"from": "right.customer_id", "as": "customer"}]}
+
+{"op": "group", "from": "p", "alias": "g",
+ "keys": ["customer"],
+ "aggregates": [{"op": "count_star", "as": "n"},
+                {"op": "count", "field": "amount", "as": "na"},
+                {"op": "sum", "field": "amount", "as": "total"},
+                {"op": "min"|"max", "field": "amount", "as": "lo"}]}
+
+{"op": "write", "effect": "insert"|"replace"|"delete",
+ "table": "customer_summary", "from": "g",
+ "target": {"field": "customer"},             // 或 {"const": int64} / {"add"|"sub": [a,b]}
+ "values": {"total": {"field": "total"}, "n": {"field": "n"}}}
+
+{"op": "guard", "test": "row_count"|"int_sum", "relation": "g",
+ "field": "total", "eq"|"ge"|"le": <int>}
+```
+
+* `read` 与 v1 同形：显式候选 `map` + 谓词过滤，形成**不可变关系别名**——每个别名
+  都是当时结果的快照，本批后续写表不会回头改变它。`row_id_field` 把源行 row_id
+  显式暴露为关系字段（覆盖同名列），供投影与写目标使用。
+* 字段引用按关系模式静态校验：表读是**开放**模式（任意简单列名都有定义，缺列读作
+  null）；project/group 输出是**封闭**模式（恰为声明的名字）；join 输出用
+  `left.`/`right.` 限定（嵌套连接逐层嵌套）。**名称冲突**（投影/聚合重名、分组键与
+  聚合同名）与**未定义字段引用**在入批校验时即拒绝，诊断含步骤号、引用与已定义
+  名字。字段关联只走声明的等值键，绝不依靠“两表恰好有相同 row_id”。
+
+### 11.2 行出现身份（稳定、与 map 排列无关）
+
+关系中每次行出现都有稳定身份：
+
+```
+read:    ["src", <step>, <row_id>]
+join:    ["join", <step>, <左身份>, <右身份|null>]
+project: ["proj", <step>, <源身份>]
+group:   ["grp", <step>, [<类型化键分量>, ...]]
+```
+
+相同值的不同输入行身份不同（源 row_id 不同）；同一对输入的不同连接配对身份不同
+（配对身份不同）。关系按身份的规范化形式排序，**换掉输入 map 的排列不会改变身份、
+关系摘要或任何下游结果**（有专项测试逐摘要断言）。身份贯穿证据：连接配对、未匹配
+左行、分组成员、写目标的 `source_identity` 都可逐级回溯到源读行。
+
+### 11.3 连接语义
+
+* 支持 `inner` 与 `left`，等值键为**一个或多个**键对。
+* 键按**类型和值**相等：整数 `1`、布尔 `true`、文本 `"1"` 是三个不同的键。
+  任一键分量为 null 或缺字段（任一侧）都**不匹配**——null 与 null 也不匹配。
+* 保留重复行贡献：两条左行与三条右行共享同一键时 inner 产生 **6** 条结果，
+  不按值去重。left 对每条无匹配左行保留一条结果，右侧字段全为 null。
+* 连接结果是普通关系，可再次连接或分组（不限两表模板）；嵌套连接的字段逐层
+  加 `left.`/`right.` 前缀，投影可把需要的字段重新命名为简单名。
+
+### 11.4 分组与聚合
+
+* 分组键由多个（投影）字段组成，**按类型区分**（`1`/`true`/`"1"` 不同组），但
+  **null 与缺字段归为同一种空值**——这与连接不匹配空值的语义不同，是有意的。
+* `count(*)` 计行出现数；`count(field)` 跳过 null；`sum` 只接收非 bool 的 int64
+  并跳过 null，全为 null 时结果为 null；`min`/`max` 跳过 null，同组非空值必须同型
+  且只能为整数或文本。
+* **空输入**：有分组键时没有组；无分组键的全局聚合仍产生一行，两个 count 为 0，
+  其余结果为 null。
+* `sum` 用**精确整数**累计，只判断**最终结果**是否超出 int64：`2**62 + 2**62 -
+  2**62 = 2**62` 这类最终可表示的正负抵消**不会**因中间和溢出而被拒绝。
+* 其他类型错误与最终溢出都使**整批不提交**，诊断给出步骤号、聚合项名与组键
+  （`abort.detail` 含 `aggregate`/`op`/`field`/`group_key`/`offending`）。
+
+### 11.5 对派生关系每行写入
+
+* 目标 row_id 由**调用者声明的整数字段**（如分组键 `customer`、读时声明的
+  `oid`）或封闭安全整数表达式（`const`/`field`/`add`/`sub`，精确 int64 检查）确定；
+  **不从遍历序号分配，也不把哈希截成整数**。目标为 null/非整数即整批失败。
+* 一个写步骤中不同派生行算出同一目标 row_id，**即使内容相等也整批拒绝**
+  （`pk_conflict`，`detail.duplicates` 定位）。
+* `insert` 目标必须不存在、`delete` 目标必须存在、`replace` 为整行 upsert；
+  派生关系可直接用于 `row_count`/`int_sum` guard，guard 失败后**同批早先的写入
+  也不留下**（批级原子，与 v1 相同）。
+* 写入后的唯一键、外键与级联仍走**现有批末检查**（§5）：显式步骤全部成功后才对
+  候选状态统一计算级联闭包与违规，关系批没有另一条无约束导入入口。
+
+### 11.6 证据与解释
+
+关系批的执行证据在 v1 骨架（reads/writes/guards/footprints/read_contents/
+constraints）之上增加 `relations`：每个别名的行数与内容摘要；每个连接的**输入配对**
+（成对的行出现身份）、**未匹配左行**与未匹配右行；每个分组的**成员身份**、类型化
+组键与聚合值；每个写目标的 `source_identity` 与前后镜像摘要。
+
+* `Ledger.explain_derived(id)` / `python3 -m revoke_ledger.cli explain-derived DB ID`
+  从**不可变批记录**读回：连接配对、未匹配左行、输出组的成员与聚合值、最终写到的
+  受管行。重开数据库读回完全一致。
+* `Ledger.explain_batch(id)` 增加 `derived` 区；撤销映射详情中的 `replay_derived`
+  保存**新世代**的派生证据（见下）。
+
+### 11.7 参与选择性撤销
+
+* 关系批的读作用域与 v1 相同：完整 map 身份（**空匹配、被过滤掉的候选和缺失候选
+  都算依赖依据**）进入目标批的影响域与跳过证明；撤销某个来源批可能恢复一条右行，
+  让 left 结果从补空行变成匹配、使一个组出现/消失、改变合计并触发 guard。
+* 后续加工批**按新输入重新得出结果**：从读步骤重放整条管道，不修补旧汇总，也不凭
+  旧的最终命中行或显式目标表证明可复用。重放结果按 v1 同一合同判定
+  Kept/Changed/Blocked（guard 失败 → `blocked_guard`，约束违反 →
+  `blocked_constraint_violation`，历史失败批永不激活）。
+* **保守重放**：关系程序永不进入跳过集合（`skip_eligibility` 记录原因）；但
+  `managed-batch/v1` 下确实无关的分区批**继续真实跳过**，撤销世代的 trace
+  （`executed_batch_ords`/`skipped_batch_ords`）证明它们未进入解释器。
+* **证据分别保存**：原始入批证据在 `ledger_batch.evidence_json`（触发器只读），
+  新世代的派生证据在 `revocation_mapping.detail.replay_derived` 与计划载荷中；
+  `explain_revocation` 可同时读回两者。计划、应用与重开后的解释沿用 §6 的世代
+  合同（陈旧计划照常拒绝）。
+
+### 11.8 命令行示例（提交的夹具）
+
+```bash
+cd /workspace
+python3 -m revoke_ledger.cli init /tmp/rel.db \
+    fixtures/relational/seed.json fixtures/relational/constraints.json
+python3 -m revoke_ledger.cli ingest /tmp/rel.db fixtures/relational/settle_inner.json
+python3 -m revoke_ledger.cli run /tmp/rel.db SETTLE-INNER
+python3 -m revoke_ledger.cli explain-derived /tmp/rel.db SETTLE-INNER
+python3 -m revoke_ledger.cli show /tmp/rel.db
+python3 -m revoke_ledger.cli run /tmp/rel.db SETTLE-FK       # 末端约束拒绝整批
+```
+
+### 11.9 演练与验收（`drills/run_relational_drills.py`）
+
+小样本入仓流程：订单 ⋈ 渠道归属 → 按客户汇总 → 受管 `customer_summary` 行。
+**预期关联配对、分组成员与最终受管行全部来自手算/独立枚举**
+（`fixtures/relational_scenarios.py` 的 `EXPECTED_*` 常量），不调用生产算子自证；
+验收逐项断言配对与金额，不只核对输出条数。覆盖：
+
+| 场景 | 期望 |
+|---|---|
+| SETTLE-INNER | 一对多：web 订单金额同时计入客户 101/102；int `1` ≠ text `"1"`；汇总行逐值等于手算 |
+| SETTLE-LEFT | 未匹配左行保留（右侧 null），以原明细 row_id 落 `order_enriched` |
+| SETTLE-COMPOSITE | 复合键中 null/缺字段任一侧都不匹配（null≠null） |
+| SETTLE-CHAIN | 连接→再连接→分组；复合分组键 (customer, name) |
+| SETTLE-EMPTY | 空输入：全局聚合一行（count 0、其余 null），带键则零组 |
+| SETTLE-CANCEL | `2**62+2**62-2**62=2**62` 最终可表示，不拒绝 |
+| SETTLE-OVERFLOW/COLLIDE/TYPEERR | 最终溢出 / 目标碰撞（同内容也拒）/ 聚合类型错误，均整批不提交、head 不变 |
+| SETTLE-FK / SETTLE-UNIQUE | 末端外键/唯一键违反经现有批末检查拒绝整批 |
+| 撤销演练 | 恢复归属行 → PROC 重推导（102 组出现、明细从补空变匹配）、G guard 阻塞零写入、v1 分区批 Z 跳过（trace 证明）；重开库读回同一组派生来源解释 |
+| CLI | init/ingest/run/explain-derived/show 全流程与手算一致 |
+
+### 11.10 关系协议的已知取舍
+
+* 关系程序在撤销时一律保守重放、从不跳过；只有 `managed-batch/v1` 分区批可跳过。
+* 派生关系行数有硬上限（100 000，超出 `limit_exceeded` 整批失败），防止连接扇出
+  失控；读 map 仍受 v1 的 10 000 上限约束。
+* 表读关系是开放模式：字段拼写错误在开放侧不会静态报错（值读作 null），一旦经过
+  project/group 形成封闭模式，未定义引用即在入批校验拒绝。
+* 关系批证据（配对、成员）随批记录持久化，体量与派生关系规模成正比；原型按小样本
+  设计，未做证据外存。

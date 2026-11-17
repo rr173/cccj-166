@@ -1,0 +1,120 @@
+{
+ "adjustments": {
+  "1": {
+   "amt": 4611686018427387904
+  },
+  "2": {
+   "amt": 4611686018427387904
+  },
+  "3": {
+   "amt": -4611686018427387904
+  }
+ },
+ "attribution": {
+  "10": {
+   "channel": "web",
+   "customer_id": 101
+  },
+  "11": {
+   "channel": "web",
+   "customer_id": 102
+  },
+  "12": {
+   "channel": "app",
+   "customer_id": 101
+  },
+  "13": {
+   "channel": 1,
+   "customer_id": 103
+  }
+ },
+ "audit_summary": {},
+ "customer_stats": {},
+ "customer_summary": {},
+ "customers": {
+  "101": {
+   "name": "acme"
+  },
+  "102": {
+   "name": "beta"
+  },
+  "103": {
+   "name": "cora"
+  }
+ },
+ "lane_owner": {
+  "20": {
+   "lane": "sea",
+   "owner": "ops",
+   "region": "cn"
+  },
+  "21": {
+   "lane": "sea",
+   "owner": "null-owner",
+   "region": null
+  },
+  "22": {
+   "lane": "air",
+   "owner": "air-ops",
+   "region": "cn"
+  }
+ },
+ "order_enriched": {},
+ "orders": {
+  "1": {
+   "amount": 100,
+   "channel": "web"
+  },
+  "2": {
+   "amount": 50,
+   "channel": "web"
+  },
+  "3": {
+   "amount": 70,
+   "channel": "app"
+  },
+  "4": {
+   "amount": 9,
+   "channel": "none"
+  },
+  "5": {
+   "amount": 20,
+   "channel": "1"
+  },
+  "6": {
+   "amount": 30,
+   "channel": 1
+  }
+ },
+ "overflows": {
+  "1": {
+   "amt": 9223372036854775807
+  },
+  "2": {
+   "amt": 1
+  }
+ },
+ "shipment_enriched": {},
+ "shipments": {
+  "1": {
+   "kg": 40,
+   "lane": "sea",
+   "region": "cn"
+  },
+  "2": {
+   "kg": 41,
+   "lane": "sea",
+   "region": null
+  },
+  "3": {
+   "kg": 42,
+   "lane": "sea"
+  },
+  "4": {
+   "kg": 10,
+   "lane": "air",
+   "region": "cn"
+  }
+ },
+ "stats": {}
+}

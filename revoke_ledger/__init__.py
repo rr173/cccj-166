@@ -20,12 +20,14 @@ Public surface (see README.md for the full protocol and semantics):
 from .constraints import (CONSTRAINT_SCHEMA, ConstraintSet, validate_config)
 from .ledger import Ledger, REASON_TEXT
 from .protocol import SCHEMA, validate_program, program_digest
+from .rprotocol import RELATIONAL_SCHEMA, validate_relational_program
 from .errors import (BatchAbort, IntegrityError, LedgerError, LimitError,
                      ProtocolError, StaleError)
 
 __all__ = [
     "Ledger", "REASON_TEXT", "SCHEMA", "validate_program", "program_digest",
     "CONSTRAINT_SCHEMA", "ConstraintSet", "validate_config",
+    "RELATIONAL_SCHEMA", "validate_relational_program",
     "BatchAbort", "IntegrityError", "LedgerError", "LimitError", "ProtocolError",
     "StaleError",
 ]

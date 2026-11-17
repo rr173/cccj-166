@@ -662,6 +662,20 @@ class Ledger:
         for b in later_success:
             part = b["key_ranges"]
             why = []
+            if b["program"].get("schema") != "managed-batch/v1":
+                # Relational programs are always conservatively replayed on
+                # revocation: their derived relations depend on the whole
+                # read scope through joins/groups, so the product re-derives
+                # them from the new inputs instead of proving a skip.  Only
+                # managed-batch/v1 partition batches are skip-eligible.
+                eligibility[b["batch_ord"]] = {
+                    "eligible": False,
+                    "why": [f"program schema "
+                            f"{b['program'].get('schema')!r}: relational "
+                            f"operators are conservatively replayed on "
+                            f"revocation (never skipped)"],
+                    "partition": part}
+                continue
             ok = part is not None
             if not ok:
                 why.append("no declared partition")
@@ -1002,6 +1016,11 @@ class Ledger:
                     "replay_deletes": self._cascade_summary(ev),
                 },
             }
+            if ev.get("relations") is not None:
+                # The new generation's derived evidence (join pairings, group
+                # members, write targets) is persisted with the mapping, kept
+                # separate from the batch's original immutable evidence.
+                decisions[bo]["detail"]["replay_derived"] = ev["relations"]
         # Originally failed batches: historical only, never activated.
         for b in (failed_success or []):
             decisions[b["batch_ord"]] = {
@@ -1628,6 +1647,11 @@ class Ledger:
             raise LedgerError(f"unknown batch {logical_batch_id!r}")
         cons = b["evidence"].get("constraints")
         abort = b["abort"] or {}
+        derived = None
+        if b["evidence"].get("relations") is not None:
+            derived = {"relations": b["evidence"]["relations"],
+                       "writes": b["evidence"].get("writes", []),
+                       "guards": b["evidence"].get("guards", [])}
         return {
             "batch_ord": b["batch_ord"],
             "logical_batch_id": b["logical_batch_id"],
@@ -1648,6 +1672,47 @@ class Ledger:
                 "deleted": (cons or {}).get("deleted", []),
             },
             "constraint_checks": (cons or None),
+            "derived": derived,
+        }
+
+    def explain_derived(self, logical_batch_id):
+        """Read back a relational batch's derived-source explanation.
+
+        Locates, from the immutable batch record: every join's input pairings
+        and unmatched left rows, every output group's member identities and
+        aggregate values, and the managed rows each derived write produced.
+        """
+        b = self.db.batch_by_logical_id(logical_batch_id)
+        if b is None:
+            raise LedgerError(f"unknown batch {logical_batch_id!r}")
+        rels = b["evidence"].get("relations")
+        if rels is None:
+            raise LedgerError(
+                f"batch {logical_batch_id!r} has no derived relations "
+                f"(schema {b['program'].get('schema')!r})")
+        return {
+            "batch_ord": b["batch_ord"],
+            "logical_batch_id": b["logical_batch_id"],
+            "status": b["status"],
+            "generation": b["generation"],
+            "joins": [
+                {"step_index": r["step_index"], "alias": r["alias"],
+                 "how": r["detail"]["how"], "on": r["detail"]["on"],
+                 "pairs": r["detail"]["pairs"],
+                 "unmatched_left": r["detail"]["unmatched_left"],
+                 "unmatched_right": r["detail"]["unmatched_right"]}
+                for r in rels if r["op"] == "join"],
+            "groups": [
+                {"step_index": r["step_index"], "alias": r["alias"],
+                 "keys": r["detail"]["keys"],
+                 "groups": r["detail"]["groups"]}
+                for r in rels if r["op"] == "group"],
+            "writes": [
+                {"step_index": w["step_index"], "effect": w["effect"],
+                 "table": w["table"], "from": w["from"],
+                 "rows": w["rows"]}
+                for w in b["evidence"].get("writes", [])],
+            "guards": b["evidence"].get("guards", []),
         }
 
     def explain_revocation(self, revocation_id_or_plan_id):
@@ -1669,6 +1734,7 @@ class Ledger:
                 "dependency_closure": d.get("constraint_dependency_keys"),
                 "actual_dependency_overlap": d.get("actual_dependency_overlap"),
                 "skipped": m.get("reuse_kind") == "skipped_independent",
+                "derived_relations": d.get("replay_derived"),
             }
         return {
             "revocation_id": view["revocation_id"],

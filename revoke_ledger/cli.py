@@ -3,6 +3,7 @@
     python3 -m revoke_ledger.cli init       DB SEED.json [CONSTRAINTS.json]
     python3 -m revoke_ledger.cli constraints DB [CONSTRAINTS.json]
     python3 -m revoke_ledger.cli explain    DB LOGICAL_ID
+    python3 -m revoke_ledger.cli explain-derived DB LOGICAL_ID
     python3 -m revoke_ledger.cli explain-rev DB REVOCATION_OR_PLAN_ID
     python3 -m revoke_ledger.cli ingest     DB PROGRAM.json
     python3 -m revoke_ledger.cli run        DB LOGICAL_ID
@@ -59,6 +60,9 @@ def main(argv):
         elif cmd == "explain":
             L = Ledger(args[0])
             _dump(L.explain_batch(args[1]))
+        elif cmd == "explain-derived":
+            L = Ledger(args[0])
+            _dump(L.explain_derived(args[1]))
         elif cmd == "explain-rev":
             L = Ledger(args[0])
             _dump(L.explain_revocation(args[1]))

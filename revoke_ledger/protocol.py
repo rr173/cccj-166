@@ -238,11 +238,16 @@ def _check_partition(part):
 
 
 def validate_program(program, batch_index=0):
-    """Validate a program against the protocol; return a deep copy.
+    """Validate a program against its declared schema; return a deep copy.
 
-    Raises ProtocolError/LimitError.  Does not touch any database.
+    managed-batch/v1 programs are validated here; managed-relational/v1
+    programs are validated in rprotocol.py.  Raises ProtocolError/LimitError.
+    Does not touch any database.
     """
     _check(isinstance(program, dict), "program must be an object")
+    if program.get("schema") == "managed-relational/v1":
+        from .rprotocol import validate_relational_program
+        return validate_relational_program(program)
     extra = set(program) - _PROG_KEYS
     _check(not extra, f"program top-level keys must be logical_batch_id/schema/steps/"
                       f"partition (extra {sorted(extra)})")
@@ -377,7 +382,11 @@ def program_digest(program):
 
 
 def program_reads(program):
-    """Static read scope derived from the program (public definition)."""
+    """Static read scope derived from the program (public definition).
+
+    Read steps have the same shape in both protocol schemas, so this covers
+    managed-batch/v1 and managed-relational/v1 programs alike.
+    """
     out = []
     for i, st in enumerate(program["steps"]):
         if st["op"] == "read":
@@ -392,4 +401,10 @@ def program_reads(program):
 
 
 def program_tables(program):
-    return sorted({st["table"] for st in program["steps"] if st["op"] in ("read", "write")})
+    out = set()
+    for st in program["steps"]:
+        if st["op"] == "read":
+            out.add(st["select"]["table"])
+        elif st["op"] == "write":
+            out.add(st["table"])
+    return sorted(out)

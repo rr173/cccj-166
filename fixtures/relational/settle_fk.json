@@ -1,0 +1,142 @@
+{
+ "logical_batch_id": "SETTLE-FK",
+ "schema": "managed-relational/v1",
+ "steps": [
+  {
+   "alias": "o",
+   "map": [
+    {
+     "row_id": 1,
+     "table": "orders"
+    },
+    {
+     "row_id": 2,
+     "table": "orders"
+    },
+    {
+     "row_id": 3,
+     "table": "orders"
+    },
+    {
+     "row_id": 4,
+     "table": "orders"
+    },
+    {
+     "row_id": 5,
+     "table": "orders"
+    },
+    {
+     "row_id": 6,
+     "table": "orders"
+    }
+   ],
+   "op": "read",
+   "row_id_field": "oid",
+   "select": {
+    "table": "orders",
+    "where": {
+     "kind": "all"
+    }
+   }
+  },
+  {
+   "alias": "a",
+   "map": [
+    {
+     "row_id": 10,
+     "table": "attribution"
+    },
+    {
+     "row_id": 11,
+     "table": "attribution"
+    },
+    {
+     "row_id": 12,
+     "table": "attribution"
+    },
+    {
+     "row_id": 13,
+     "table": "attribution"
+    }
+   ],
+   "op": "read",
+   "select": {
+    "table": "attribution",
+    "where": {
+     "kind": "all"
+    }
+   }
+  },
+  {
+   "alias": "j",
+   "how": "inner",
+   "left": "o",
+   "on": [
+    {
+     "left": "channel",
+     "right": "channel"
+    }
+   ],
+   "op": "join",
+   "right": "a"
+  },
+  {
+   "alias": "p",
+   "from": "j",
+   "op": "project",
+   "select": [
+    {
+     "as": "customer",
+     "from": "right.customer_id"
+    },
+    {
+     "as": "amount",
+     "from": "left.amount"
+    }
+   ]
+  },
+  {
+   "aggregates": [
+    {
+     "as": "n",
+     "op": "count_star"
+    },
+    {
+     "as": "total",
+     "field": "amount",
+     "op": "sum"
+    }
+   ],
+   "alias": "g",
+   "from": "p",
+   "keys": [
+    "customer"
+   ],
+   "op": "group"
+  },
+  {
+   "effect": "insert",
+   "from": "g",
+   "op": "write",
+   "table": "audit_summary",
+   "target": {
+    "field": "customer"
+   },
+   "values": {
+    "customer_ref": {
+     "add": [
+      {
+       "field": "customer"
+      },
+      {
+       "const": 1000
+      }
+     ]
+    },
+    "total": {
+     "field": "total"
+    }
+   }
+  }
+ ]
+}

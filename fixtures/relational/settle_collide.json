@@ -1,0 +1,54 @@
+{
+ "logical_batch_id": "SETTLE-COLLIDE",
+ "schema": "managed-relational/v1",
+ "steps": [
+  {
+   "alias": "o",
+   "map": [
+    {
+     "row_id": 1,
+     "table": "orders"
+    },
+    {
+     "row_id": 3,
+     "table": "orders"
+    }
+   ],
+   "op": "read",
+   "select": {
+    "table": "orders",
+    "where": {
+     "kind": "all"
+    }
+   }
+  },
+  {
+   "aggregates": [
+    {
+     "as": "n",
+     "op": "count_star"
+    }
+   ],
+   "alias": "g",
+   "from": "o",
+   "keys": [
+    "channel"
+   ],
+   "op": "group"
+  },
+  {
+   "effect": "insert",
+   "from": "g",
+   "op": "write",
+   "table": "stats",
+   "target": {
+    "const": 700
+   },
+   "values": {
+    "x": {
+     "const": 1
+    }
+   }
+  }
+ ]
+}

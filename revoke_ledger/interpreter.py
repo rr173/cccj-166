@@ -109,8 +109,36 @@ def row_digest(row):
     return sha256(row) if row is not None else None
 
 
+def finalize_constraints(constraints, pre_state, state, writes_ev, step_count):
+    """Shared batch-final constraint gate for every program schema.
+
+    Runs the declared rules on the completed candidate state (cascade closure,
+    then surviving-row checks).  Returns (report, abort-or-None).
+    """
+    report = constraints.finalize(pre_state, state, writes_ev)
+    if report["ok"]:
+        return report, None
+    first = report["reasons"][0]
+    where = f"{first['table']}[{first.get('row_id')}]"
+    target = (" no rows are written"
+              if not report["deleted"] else
+              f" its {len(report['deleted'])} planned deletes are discarded")
+    abort = BatchAbort(
+        "constraint_violation",
+        f"{where} violates rule {first['rule']!r} ({first['code']});"
+        f"{target}", step_index=step_count, table=first["table"],
+        row_id=first.get("row_id"),
+        detail={"constraints": report, "reasons": report["reasons"]})
+    return report, abort
+
+
 def execute_program(prog, state, constraints=None):
     """Execute one validated program on `state`.
+
+    Dispatches on the program schema: managed-batch/v1 programs run the
+    explicit row-mapping interpreter below; managed-relational/v1 programs
+    run the relational pipeline in relational.py.  Both share the same
+    batch-final constraint gate and the same evidence contract.
 
     Mutates `state` as it goes.  On failure the caller must discard the state.
     Returns evidence:
@@ -123,6 +151,9 @@ def execute_program(prog, state, constraints=None):
     applied, then surviving references and unique keys are checked.  A failure
     raises BatchAbort('constraint_violation') with the full report in detail.
     """
+    if prog.get("schema") == "managed-relational/v1":
+        from .relational import execute_relational_program
+        return execute_relational_program(prog, state, constraints=constraints)
     pre_state = state.copy() if constraints is not None else None
     reads_ev = []
     writes_ev = []
@@ -299,19 +330,8 @@ def execute_program(prog, state, constraints=None):
 
     report = None
     if aborted is None and constraints is not None:
-        report = constraints.finalize(pre_state, state, writes_ev)
-        if not report["ok"]:
-            first = report["reasons"][0]
-            where = f"{first['table']}[{first.get('row_id')}]"
-            target = (" no rows are written"
-                      if not report["deleted"] else
-                      f" its {len(report['deleted'])} planned deletes are discarded")
-            aborted = BatchAbort(
-                "constraint_violation",
-                f"{where} violates rule {first['rule']!r} ({first['code']});"
-                f"{target}", step_index=len(prog["steps"]), table=first["table"],
-                row_id=first.get("row_id"),
-                detail={"constraints": report, "reasons": report["reasons"]})
+        report, aborted = finalize_constraints(
+            constraints, pre_state, state, writes_ev, len(prog["steps"]))
 
     return {
         "ok": aborted is None,
